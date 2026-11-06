@@ -1,7 +1,7 @@
 use crate::{
     DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
     conversation_view::thread_search_bar::{ThreadSearchBar, ThreadSearchBarEvent},
-    entry_view_state::TERMINAL_CONTENT_TOP_PADDING,
+    entry_view_state::{TERMINAL_CONTENT_TOP_PADDING, ToolCallExpansion},
     open_abs_path_at_point, project_path_for_file_link,
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
@@ -44,7 +44,7 @@ use language_model::{
 };
 use notifications::status_toast::StatusToast;
 use project::ResolvedPath;
-use settings::{update_settings_file, update_settings_file_with_completion};
+use settings::{SettingsStore, update_settings_file, update_settings_file_with_completion};
 use ui::{
     ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
     SplitButtonStyle, Tab, ToggleState,
@@ -53,6 +53,10 @@ use url::Url;
 use util::markdown::source_position_from_fragment;
 use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 
+use super::activity_group::{
+    ActivityGroup, activity_group_at, activity_summary, current_step_label, first_line_of_label,
+    group_role, tool_call_has_visible_content,
+};
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
@@ -439,6 +443,14 @@ impl RenderOnce for CatNumberedCodeBlock {
     }
 }
 
+fn tool_call_expansion_icon(expansion: ToolCallExpansion) -> IconName {
+    match expansion {
+        ToolCallExpansion::Collapsed => IconName::ChevronRight,
+        ToolCallExpansion::Input => IconName::ChevronDown,
+        ToolCallExpansion::Output => IconName::ChevronUp,
+    }
+}
+
 fn render_cat_numbered_code_block(
     parsed: ParsedCatNumberedCode,
     language: Option<Arc<Language>>,
@@ -789,6 +801,7 @@ pub struct ThreadView {
     revealed_unsettled_submissions: HashSet<SubmissionId>,
     submission_reveal_tasks: HashMap<SubmissionId, Task<()>>,
     pub _subscriptions: Vec<Subscription>,
+    collapse_activity: bool,
     pub message_editor: Entity<MessageEditor>,
     pub add_context_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub thinking_effort_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1044,6 +1057,16 @@ impl ThreadView {
         let parent_session_id = thread.read(cx).parent_session_id().cloned();
 
         subscriptions.push(cx.observe(&thread, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
+            let collapse_activity = AgentSettings::get_global(cx).collapse_activity;
+            if this.collapse_activity != collapse_activity {
+                this.collapse_activity = collapse_activity;
+                // Hiding or showing grouped entries changes the height of many rows at once.
+                this.list_state
+                    .remeasure_items(0..this.list_state.item_count());
+                cx.notify();
+            }
+        }));
         subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
         subscriptions.push(cx.subscribe(&thread, |this, _, event, cx| {
             if matches!(
@@ -1287,6 +1310,7 @@ impl ThreadView {
             session_capabilities,
             resumed_without_history,
             _subscriptions: subscriptions,
+            collapse_activity: AgentSettings::get_global(cx).collapse_activity,
             permission_dropdown_handle: PopoverMenuHandle::default(),
             thread_retry_status: None,
             thread_error: None,
@@ -4693,11 +4717,7 @@ impl ThreadView {
                                     ),
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.list_state.scroll_to(ListOffset {
-                                        item_ix: entry_ix,
-                                        offset_in_item: px(0.0),
-                                    });
-                                    cx.notify();
+                                    this.scroll_to_entry(entry_ix, cx);
                                 }))
                         },
                     )),
@@ -4793,11 +4813,7 @@ impl ThreadView {
                             .color(Color::Default),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.list_state.scroll_to(ListOffset {
-                            item_ix: entry_ix,
-                            offset_in_item: px(0.0),
-                        });
-                        cx.notify();
+                        this.scroll_to_entry(entry_ix, cx);
                     })),
             );
 
@@ -7455,48 +7471,74 @@ impl ThreadView {
                 .get(entry_ix.saturating_sub(1))
                 .is_none_or(|entry| !entry.is_indented());
 
-        let mut assistant_message_is_blank = false;
+        let activity_group = self.activity_group_for_entry(entry_ix, cx);
+        let group_is_collapsed = activity_group.as_ref().is_some_and(|group| {
+            !self
+                .entry_view_state
+                .read(cx)
+                .is_activity_group_expanded(group.key())
+        });
+        let hide_entry = group_is_collapsed
+            && activity_group
+                .as_ref()
+                .is_some_and(|group| group.members.contains(&entry_ix))
+            && !self.entry_awaits_user(entry_ix, entry, cx);
+        let hide_leading_thoughts = group_is_collapsed
+            && activity_group
+                .as_ref()
+                .is_some_and(|group| group.trailing_thoughts == Some(entry_ix));
 
-        let primary = match &entry {
-            AgentThreadEntry::UserMessage(message) => {
-                if message.content.source_blocks().is_empty() {
-                    return Empty.into_any_element();
-                }
-                let Some(editor) = self
-                    .entry_view_state
-                    .read(cx)
-                    .entry(entry_ix)
-                    .and_then(|entry| entry.message_editor())
-                    .cloned()
-                else {
-                    return Empty.into_any_element();
-                };
+        // A hidden thought-only reply still ends its turn, so it keeps the turn controls.
+        let mut assistant_message_is_blank = hide_entry
+            && !matches!(entry, AgentThreadEntry::AssistantMessage(message)
+            if message.chunks.iter().any(|chunk| match chunk {
+                AssistantMessageChunk::Message { block, .. }
+                | AssistantMessageChunk::Thought { block, .. } => block.visible_content(cx),
+            }));
 
-                let editing = self.editing_message == Some(entry_ix);
-                let editor_focus = editor.focus_handle(cx).is_focused(window);
-                let focus_border = cx.theme().colors().border_focused;
-                // Drop shadows render as a dark halo on transparent windows.
-                let opaque_window = cx.theme().window_background_appearance()
-                    == gpui::WindowBackgroundAppearance::Opaque;
+        let primary = if hide_entry {
+            Empty.into_any()
+        } else {
+            match &entry {
+                AgentThreadEntry::UserMessage(message) => {
+                    if message.content.source_blocks().is_empty() {
+                        return Empty.into_any_element();
+                    }
+                    let Some(editor) = self
+                        .entry_view_state
+                        .read(cx)
+                        .entry(entry_ix)
+                        .and_then(|entry| entry.message_editor())
+                        .cloned()
+                    else {
+                        return Empty.into_any_element();
+                    };
 
-                let is_subagent = self.is_subagent();
-                let can_rewind = self
-                    .thread
-                    .read(cx)
-                    .can_rewind_to(message.client_id.as_ref(), cx);
-                let source_is_representable = message
-                    .content
-                    .source_blocks()
-                    .iter()
-                    .all(acp_thread::content::can_convert_to_v1);
-                let is_editable = can_rewind && source_is_representable;
-                let agent_name = if is_subagent {
-                    "subagents".into()
-                } else {
-                    self.agent_id.clone()
-                };
+                    let editing = self.editing_message == Some(entry_ix);
+                    let editor_focus = editor.focus_handle(cx).is_focused(window);
+                    let focus_border = cx.theme().colors().border_focused;
+                    // Drop shadows render as a dark halo on transparent windows.
+                    let opaque_window = cx.theme().window_background_appearance()
+                        == gpui::WindowBackgroundAppearance::Opaque;
 
-                v_flex()
+                    let is_subagent = self.is_subagent();
+                    let can_rewind = self
+                        .thread
+                        .read(cx)
+                        .can_rewind_to(message.client_id.as_ref(), cx);
+                    let source_is_representable = message
+                        .content
+                        .source_blocks()
+                        .iter()
+                        .all(acp_thread::content::can_convert_to_v1);
+                    let is_editable = can_rewind && source_is_representable;
+                    let agent_name = if is_subagent {
+                        "subagents".into()
+                    } else {
+                        self.agent_id.clone()
+                    };
+
+                    v_flex()
                     .id(("user_message", entry_ix))
                     .map(|this| {
                         if is_first_indented {
@@ -7630,123 +7672,101 @@ impl ThreadView {
                             }),
                     )
                     .into_any()
-            }
-            AgentThreadEntry::AssistantMessage(AssistantMessage {
-                chunks,
-                indented: _,
-                is_subagent_output: _,
-            }) => {
-                let mut is_blank = true;
-
-                let message_body = v_flex()
-                    .w_full()
-                    .gap_3()
-                    .children(chunks.iter().enumerate().filter_map(
-                        |(chunk_ix, chunk)| match chunk {
-                            AssistantMessageChunk::Message { block, .. } => {
-                                let this_is_blank = !block.visible_content(cx);
-                                is_blank = is_blank && this_is_blank;
-                                (!this_is_blank).then(|| {
-                                    div()
-                                        .id(("assistant-message-chunk", chunk_ix))
-                                        .child(self.render_message_content(
-                                            entry_ix, chunk_ix, block, window, cx,
-                                        ))
-                                        .into_any_element()
-                                })
-                            }
-                            AssistantMessageChunk::Thought { block, .. } => {
-                                let this_is_blank = !block.visible_content(cx);
-                                is_blank = is_blank && this_is_blank;
-                                (!this_is_blank).then(|| {
-                                    self.render_thinking_block(
-                                        entry_ix, chunk_ix, block, window, cx,
-                                    )
-                                    .into_any_element()
-                                })
-                            }
-                        },
-                    ))
-                    .into_any();
-
-                assistant_message_is_blank = is_blank;
-
-                if is_blank {
-                    Empty.into_any()
-                } else {
-                    v_flex()
-                        .px_5()
-                        .py_1p5()
-                        .when(is_thread_bottom, |this| this.pb_4())
-                        .w_full()
-                        .text_ui(cx)
-                        .child(message_body)
-                        .when_some(
-                            self.entry_view_state
-                                .read(cx)
-                                .entry(entry_ix)
-                                .and_then(|entry| entry.focus_handle(cx)),
-                            |this, handle| this.track_focus(&handle),
-                        )
-                        .into_any()
                 }
-            }
-            AgentThreadEntry::ToolCall(tool_call) => {
-                // A canceled tool call that produced visible output is still worth
-                // showing, but one that was canceled before producing anything just
-                // renders as a useless "Canceled" card — hide those entirely.
-                if matches!(tool_call.status(), ToolCallStatus::Canceled) {
-                    let has_visible_content =
-                        tool_call.content().iter().any(|content| match content {
-                            ToolCallContent::ContentBlock { block, .. } => {
-                                block.visible_content(cx)
-                            }
-                            ToolCallContent::Diff(_)
-                            | ToolCallContent::LegacyDiff { .. }
-                            | ToolCallContent::Terminal { .. } => true,
-                            ToolCallContent::DiffPatch { render, .. } => {
-                                !render.files.is_empty()
-                                    || render.fallback.as_ref().is_some_and(|markdown| {
-                                        !markdown.read(cx).source().is_empty()
+                AgentThreadEntry::AssistantMessage(AssistantMessage {
+                    chunks,
+                    indented: _,
+                    is_subagent_output: _,
+                }) => {
+                    let mut is_blank = true;
+                    let first_text_chunk_ix = if hide_leading_thoughts {
+                        chunks
+                        .iter()
+                        .position(|chunk| {
+                            matches!(chunk, AssistantMessageChunk::Message { block, .. } if block.visible_content(cx))
+                        })
+                        .unwrap_or(chunks.len())
+                    } else {
+                        0
+                    };
+
+                    let message_body = v_flex()
+                        .w_full()
+                        .gap_3()
+                        .children(chunks.iter().enumerate().filter_map(|(chunk_ix, chunk)| {
+                            match chunk {
+                                AssistantMessageChunk::Message { block, .. } => {
+                                    let this_is_blank = !block.visible_content(cx);
+                                    is_blank = is_blank && this_is_blank;
+                                    (!this_is_blank).then(|| {
+                                        div()
+                                            .id(("assistant-message-chunk", chunk_ix))
+                                            .child(self.render_message_content(
+                                                entry_ix, chunk_ix, block, window, cx,
+                                            ))
+                                            .into_any_element()
                                     })
+                                }
+                                AssistantMessageChunk::Thought { .. }
+                                    if chunk_ix < first_text_chunk_ix =>
+                                {
+                                    None
+                                }
+                                AssistantMessageChunk::Thought { block, .. } => {
+                                    let this_is_blank = !block.visible_content(cx);
+                                    is_blank = is_blank && this_is_blank;
+                                    (!this_is_blank).then(|| {
+                                        self.render_thinking_block(
+                                            entry_ix, chunk_ix, block, window, cx,
+                                        )
+                                        .into_any_element()
+                                    })
+                                }
                             }
-                            ToolCallContent::SessionReference(_) => true,
-                            ToolCallContent::Other { markdown, .. } => {
-                                !markdown.read(cx).source().is_empty()
-                            }
-                        });
-                    if !has_visible_content {
-                        return Empty.into_any();
+                        }))
+                        .into_any();
+
+                    assistant_message_is_blank = is_blank;
+
+                    if is_blank {
+                        Empty.into_any()
+                    } else {
+                        v_flex()
+                            .px_5()
+                            .py_1p5()
+                            .when(is_thread_bottom, |this| this.pb_4())
+                            .w_full()
+                            .text_ui(cx)
+                            .child(message_body)
+                            .when_some(
+                                self.entry_view_state
+                                    .read(cx)
+                                    .entry(entry_ix)
+                                    .and_then(|entry| entry.focus_handle(cx)),
+                                |this, handle| this.track_focus(&handle),
+                            )
+                            .into_any()
                     }
                 }
+                AgentThreadEntry::ToolCall(tool_call) => {
+                    // A canceled tool call that produced visible output is still worth
+                    // showing, but one that was canceled before producing anything just
+                    // renders as a useless "Canceled" card — hide those entirely.
+                    if matches!(tool_call.status(), ToolCallStatus::Canceled)
+                        && !tool_call_has_visible_content(tool_call, cx)
+                    {
+                        return Empty.into_any();
+                    }
 
-                let tool_call = self.render_any_tool_call(
-                    self.thread.read(cx).session_id(),
-                    entry_ix,
-                    tool_call,
-                    &self.focus_handle(cx),
-                    ToolCallLayout::Standalone,
-                    window,
-                    cx,
-                );
-
-                if let Some(handle) = self
-                    .entry_view_state
-                    .read(cx)
-                    .entry(entry_ix)
-                    .and_then(|entry| entry.focus_handle(cx))
-                {
-                    tool_call.track_focus(&handle).into_any()
-                } else {
-                    tool_call.into_any()
-                }
-            }
-            AgentThreadEntry::Elicitation(elicitation_id) => {
-                let thread = self.thread.read(cx);
-                if let Some((_, elicitation)) = thread.elicitation(elicitation_id)
-                    && should_render_elicitation(elicitation)
-                {
-                    let elicitation = self.render_elicitation(entry_ix, elicitation, window, cx);
+                    let tool_call = self.render_any_tool_call(
+                        self.thread.read(cx).session_id(),
+                        entry_ix,
+                        tool_call,
+                        &self.focus_handle(cx),
+                        ToolCallLayout::Standalone,
+                        window,
+                        cx,
+                    );
 
                     if let Some(handle) = self
                         .entry_view_state
@@ -7754,34 +7774,65 @@ impl ThreadView {
                         .entry(entry_ix)
                         .and_then(|entry| entry.focus_handle(cx))
                     {
-                        elicitation.track_focus(&handle).into_any()
+                        tool_call.track_focus(&handle).into_any()
                     } else {
-                        elicitation.into_any()
+                        tool_call.into_any()
                     }
-                } else {
-                    Empty.into_any()
+                }
+                AgentThreadEntry::Elicitation(elicitation_id) => {
+                    let thread = self.thread.read(cx);
+                    if let Some((_, elicitation)) = thread.elicitation(elicitation_id)
+                        && should_render_elicitation(elicitation)
+                    {
+                        let elicitation =
+                            self.render_elicitation(entry_ix, elicitation, window, cx);
+
+                        if let Some(handle) = self
+                            .entry_view_state
+                            .read(cx)
+                            .entry(entry_ix)
+                            .and_then(|entry| entry.focus_handle(cx))
+                        {
+                            elicitation.track_focus(&handle).into_any()
+                        } else {
+                            elicitation.into_any()
+                        }
+                    } else {
+                        Empty.into_any()
+                    }
+                }
+                AgentThreadEntry::ContextCompaction(compaction) => {
+                    self.render_context_compaction(entry_ix, compaction, window, cx)
+                }
+                AgentThreadEntry::SessionMessage(message) => {
+                    let session_message =
+                        match acp_subagent_card(self.thread.read(cx), entry_ix, message, cx) {
+                            Some(card) => {
+                                self.render_acp_subagent_card(entry_ix, &card, window, cx)
+                            }
+                            None => self.render_session_message(entry_ix, message, window, cx),
+                        };
+                    if let Some(handle) = self
+                        .entry_view_state
+                        .read(cx)
+                        .entry(entry_ix)
+                        .and_then(|entry| entry.focus_handle(cx))
+                    {
+                        session_message.track_focus(&handle).into_any()
+                    } else {
+                        session_message.into_any()
+                    }
                 }
             }
-            AgentThreadEntry::ContextCompaction(compaction) => {
-                self.render_context_compaction(entry_ix, compaction, window, cx)
-            }
-            AgentThreadEntry::SessionMessage(message) => {
-                let session_message =
-                    match acp_subagent_card(self.thread.read(cx), entry_ix, message, cx) {
-                        Some(card) => self.render_acp_subagent_card(entry_ix, &card, window, cx),
-                        None => self.render_session_message(entry_ix, message, window, cx),
-                    };
-                if let Some(handle) = self
-                    .entry_view_state
-                    .read(cx)
-                    .entry(entry_ix)
-                    .and_then(|entry| entry.focus_handle(cx))
-                {
-                    session_message.track_focus(&handle).into_any()
-                } else {
-                    session_message.into_any()
-                }
-            }
+        };
+
+        let primary = match &activity_group {
+            Some(group) if group.key() == entry_ix => v_flex()
+                .w_full()
+                .child(self.render_activity_summary(group, !group_is_collapsed, cx))
+                .child(primary)
+                .into_any_element(),
+            _ => primary,
         };
 
         let is_subagent_output = self.is_subagent()
@@ -7822,7 +7873,7 @@ impl ThreadView {
 
         let thread = self.thread.clone();
 
-        let primary = if is_indented {
+        let primary = if is_indented && !hide_entry {
             let line_top = if is_first_indented {
                 rems_from_px(-12.0_f32)
             } else {
@@ -7928,6 +7979,167 @@ impl ThreadView {
         } else {
             primary
         }
+    }
+
+    fn activity_group_for_entry(&self, entry_ix: usize, cx: &App) -> Option<ActivityGroup> {
+        if !AgentSettings::get_global(cx).collapse_activity {
+            return None;
+        }
+        let thread = self.thread.read(cx);
+        activity_group_at(thread.entries().len(), entry_ix, |entry_ix| {
+            group_role(thread, entry_ix, cx)
+        })
+    }
+
+    /// An entry asking for a decision stays visible inside a collapsed group,
+    /// including a subagent card whose subagent waits for permission.
+    fn entry_awaits_user(
+        &self,
+        entry_ix: usize,
+        entry: &AgentThreadEntry,
+        cx: &Context<Self>,
+    ) -> bool {
+        let subagent_session_id = match entry {
+            AgentThreadEntry::ToolCall(tool_call) => {
+                if matches!(tool_call.status(), ToolCallStatus::WaitingForConfirmation)
+                    || tool_call.authorization_id().is_some()
+                    || self
+                        .render_generic_tool_permissions(
+                            self.thread.read(cx).session_id(),
+                            tool_call,
+                            cx,
+                        )
+                        .is_some()
+                {
+                    return true;
+                }
+                tool_call
+                    .subagent_session_info
+                    .as_ref()
+                    .map(|info| info.session_id.clone())
+            }
+            AgentThreadEntry::SessionMessage(message) => {
+                acp_subagent_card(self.thread.read(cx), entry_ix, message, cx)
+                    .map(|card| card.subagent.read(cx).session_id().clone())
+            }
+            AgentThreadEntry::UserMessage(_)
+            | AgentThreadEntry::AssistantMessage(_)
+            | AgentThreadEntry::Elicitation(_)
+            | AgentThreadEntry::ContextCompaction(_) => None,
+        };
+        subagent_session_id.is_some_and(|session_id| {
+            self.conversation
+                .read(cx)
+                .subagents_awaiting_permission(cx)
+                .iter()
+                .any(|(awaiting_session_id, _)| awaiting_session_id == &session_id)
+        })
+    }
+
+    pub(crate) fn toggle_activity_group(
+        &mut self,
+        group: ActivityGroup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = group.key();
+        let expanded = self.entry_view_state.update(cx, |state, _cx| {
+            state.toggle_activity_group(key);
+            state.is_activity_group_expanded(key)
+        });
+        if expanded {
+            for entry_ix in group.entries() {
+                self.materialize_tool_call_views(entry_ix, window, cx);
+            }
+        }
+        self.list_state.remeasure_items(group.entries());
+        self.refresh_thread_search(window, cx);
+        cx.notify();
+    }
+
+    fn render_activity_summary(
+        &self,
+        group: &ActivityGroup,
+        is_expanded: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let thread = self.thread.read(cx);
+        let summary = activity_summary(thread, group, cx);
+        let is_generating = matches!(thread.status(), ThreadStatus::Generating);
+        let is_last_group = group.entries().end >= thread.entries().len();
+        let current_step = if is_generating && is_last_group {
+            current_step_label(thread, group, cx)
+        } else {
+            None
+        };
+        if summary.is_empty() && current_step.is_none() {
+            return Empty.into_any_element();
+        }
+
+        let key = group.key();
+        let failed_count = summary.failed_count();
+        let font_size = LabelSize::Custom(self.tool_name_font_size());
+        let hover_background = cx.theme().colors().element_hover;
+
+        h_flex()
+            .id(("activity-summary", key))
+            .debug_selector(move || format!("activity-summary-{key}"))
+            .w_full()
+            .px_5()
+            .py_1()
+            .gap_1p5()
+            .overflow_hidden()
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover_background))
+            .child(
+                Icon::new(if is_expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(
+                Label::new(summary.text())
+                    .size(font_size)
+                    .color(Color::Muted)
+                    .single_line(),
+            )
+            .when(failed_count > 0, |this| {
+                this.child(
+                    Label::new(format!("· {failed_count} failed"))
+                        .size(font_size)
+                        .color(Color::Error)
+                        .single_line(),
+                )
+            })
+            .when_some(current_step, |this, step| {
+                this.child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            SpinnerLabel::new()
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(step)
+                                .size(font_size)
+                                .color(Color::Muted)
+                                .buffer_font(cx)
+                                .truncate(),
+                        ),
+                )
+            })
+            .on_click(cx.listener({
+                let group = group.clone();
+                move |this, _event: &ClickEvent, window, cx| {
+                    this.toggle_activity_group(group.clone(), window, cx);
+                }
+            }))
+            .into_any_element()
     }
 
     fn render_elicitation(
@@ -8249,6 +8461,7 @@ impl ThreadView {
         };
 
         h_flex()
+            .debug_selector(|| format!("thread-controls-{entry_ix}"))
             .w_full()
             .py_1p5()
             .px_4()
@@ -8361,6 +8574,20 @@ impl ThreadView {
     }
 
     pub(crate) fn scroll_to_entry(&mut self, entry_ix: usize, cx: &mut Context<Self>) {
+        if let Some(group) = self.activity_group_for_entry(entry_ix, cx) {
+            let key = group.key();
+            let expanded = self.entry_view_state.update(cx, |state, _cx| {
+                if !state.is_activity_group_expanded(key) {
+                    state.toggle_activity_group(key);
+                    true
+                } else {
+                    false
+                }
+            });
+            if expanded {
+                self.list_state.remeasure_items(group.entries());
+            }
+        }
         self.list_state.scroll_to(ListOffset {
             item_ix: entry_ix,
             offset_in_item: px(0.),
@@ -8540,11 +8767,7 @@ impl ThreadView {
                     let view = view.clone();
                     cx.defer(move |cx| {
                         view.update(cx, |this, cx| {
-                            this.list_state.scroll_to(gpui::ListOffset {
-                                item_ix: entry_ix,
-                                offset_in_item: gpui::px(0.),
-                            });
-                            cx.notify();
+                            this.scroll_to_entry(entry_ix, cx);
                         })
                         .ok();
                     });
@@ -9360,6 +9583,99 @@ impl ThreadView {
             .child(div().absolute().top_1().right_1().child(copy_button))
     }
 
+    fn render_command_first_line(&self, label: &Entity<Markdown>, cx: &Context<Self>) -> Div {
+        h_flex().min_w_0().flex_1().p_1p5().child(
+            Label::new(first_line_of_label(&label.read(cx).source()))
+                .buffer_font(cx)
+                .size(LabelSize::Small)
+                .truncate(),
+        )
+    }
+
+    fn render_tool_call_disclosure(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        expansion: ToolCallExpansion,
+        hover_group: &SharedString,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let icon = tool_call_expansion_icon(expansion);
+        let tooltip = match expansion.next() {
+            ToolCallExpansion::Collapsed => "Collapse",
+            ToolCallExpansion::Input => "Show Input",
+            ToolCallExpansion::Output => "Show Output",
+        };
+        Disclosure::new(
+            ("expand-output", entry_ix),
+            expansion != ToolCallExpansion::Collapsed,
+        )
+        .opened_icon(icon)
+        .closed_icon(icon)
+        .visible_on_hover(hover_group)
+        .tooltip(Tooltip::text(tooltip))
+        .on_click(cx.listener({
+            let id = tool_call.id.clone();
+            move |this: &mut Self, _, window, cx: &mut Context<Self>| {
+                this.entry_view_state.update(cx, |state, _cx| {
+                    state.cycle_tool_call_expansion(&id);
+                });
+                this.materialize_tool_call_views(entry_ix, window, cx);
+                this.list_state.remeasure_items(entry_ix..entry_ix + 1);
+                this.refresh_thread_search(window, cx);
+                cx.notify();
+            }
+        }))
+        .into_any_element()
+    }
+
+    /// The input-only view between the one-line header and the full output.
+    fn render_tool_call_input(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        is_edit: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let container = v_flex()
+            .debug_selector(|| format!("tool-call-input-{}", tool_call.id.0))
+            .mt_1p5()
+            .ml(rems(0.4))
+            .px_3p5()
+            .pb_1()
+            .gap_1()
+            .border_l_1()
+            .border_color(self.tool_card_border_color(cx));
+        if is_edit {
+            if tool_call.locations.is_empty() {
+                return None;
+            }
+            return Some(
+                container
+                    .children(tool_call.locations.iter().map(|location| {
+                        Label::new(location.path.display().to_string())
+                            .buffer_font(cx)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                    }))
+                    .into_any_element(),
+            );
+        }
+        let input = tool_call.raw_input_markdown.clone()?;
+        Some(
+            container
+                .child(div().id(("tool-call-raw-input-markdown", entry_ix)).child(
+                    self.render_markdown(
+                        input,
+                        MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                        cx,
+                    ),
+                ))
+                .into_any_element(),
+        )
+    }
+
     fn render_terminal_tool_call(
         &self,
         active_session_id: &acp_v2::SessionId,
@@ -9423,18 +9739,25 @@ impl ThreadView {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "current directory".to_string());
 
-        let command_element = self.render_collapsible_command(
-            header_group.clone(),
-            false,
-            tool_call.label.clone(),
-            window,
-            cx,
-        );
-
-        let is_expanded = self
+        let expansion = self
             .entry_view_state
             .read(cx)
-            .is_tool_call_expanded(&tool_call.id);
+            .tool_call_expansion(&tool_call.id);
+        let is_expanded = expansion == ToolCallExpansion::Output;
+        let command_element = if expansion == ToolCallExpansion::Collapsed && !needs_confirmation {
+            self.render_command_first_line(&tool_call.label, cx)
+                .into_any_element()
+        } else {
+            self.render_collapsible_command(
+                header_group.clone(),
+                false,
+                tool_call.label.clone(),
+                window,
+                cx,
+            )
+            .debug_selector(|| format!("tool-call-input-{}", tool_call.id.0))
+            .into_any_element()
+        };
 
         let truncated_tooltip = truncated_output.then(|| {
             if let Some(output) = output {
@@ -9472,6 +9795,7 @@ impl ThreadView {
             working_dir,
             is_expanded,
         )
+        .disclosure_icon(tool_call_expansion_icon(expansion))
         .rounded_corners(is_standalone, is_standalone && !has_content_below)
         .elapsed(time_elapsed)
         .running(!command_finished && !needs_confirmation)
@@ -9479,7 +9803,7 @@ impl ThreadView {
             let id = tool_call.id.clone();
             move |this, _event, window, cx| {
                 this.entry_view_state.update(cx, |state, _cx| {
-                    state.toggle_tool_call_expansion(&id);
+                    state.cycle_tool_call_expansion(&id);
                 });
                 this.materialize_tool_call_views(entry_ix, window, cx);
                 this.refresh_thread_search(window, cx);
@@ -9532,6 +9856,7 @@ impl ThreadView {
             .when(is_expanded && terminal_view.is_some(), |this| {
                 this.child(
                     div()
+                        .debug_selector(|| format!("tool-call-output-{}", tool_call.id.0))
                         .border_t_1()
                         .when(tool_failed || command_failed, |card| card.border_dashed())
                         .border_color(border_color)
@@ -9789,12 +10114,18 @@ impl ThreadView {
         let has_content = !tool_call.content().is_empty()
             || (should_show_raw_input && tool_call.raw_input.is_some());
 
-        let is_collapsible = has_content && !needs_confirmation;
+        // A shell command always has its full text to reveal, even without output.
+        let is_collapsible = (has_content || is_terminal_tool) && !needs_confirmation;
+        let expansion = self
+            .entry_view_state
+            .read(cx)
+            .tool_call_expansion(&tool_call.id);
         let is_open = self
             .entry_view_state
             .read(cx)
             .is_tool_call_content_visible(tool_call)
             || generic_permissions.is_some();
+        let shows_input = is_open || expansion == ToolCallExpansion::Input || needs_confirmation;
 
         let input_output_header = |label: SharedString| {
             Label::new(label)
@@ -10033,16 +10364,52 @@ impl ThreadView {
 
         let body = v_flex()
             .map(|this| {
-                if is_terminal_tool {
+                if is_terminal_tool && !shows_input {
                     this.child(
-                        self.render_collapsible_command(
-                            card_header_id.clone(),
-                            true,
-                            tool_call.label.clone(),
-                            window,
-                            cx,
-                        )
-                        .bg(self.tool_card_header_bg(cx)),
+                        h_flex()
+                            .group(&card_header_id)
+                            .w_full()
+                            .justify_between()
+                            .bg(self.tool_card_header_bg(cx))
+                            .child(self.render_command_first_line(&tool_call.label, cx))
+                            .child(
+                                self.render_tool_call_disclosure(
+                                    entry_ix,
+                                    tool_call,
+                                    expansion,
+                                    &card_header_id,
+                                    cx,
+                                ),
+                            ),
+                    )
+                } else if is_terminal_tool {
+                    this.child(
+                        h_flex()
+                            .group(&card_header_id)
+                            .w_full()
+                            .items_start()
+                            .justify_between()
+                            .bg(self.tool_card_header_bg(cx))
+                            .child(
+                                self.render_collapsible_command(
+                                    card_header_id.clone(),
+                                    true,
+                                    tool_call.label.clone(),
+                                    window,
+                                    cx,
+                                )
+                                .flex_1()
+                                .debug_selector(|| format!("tool-call-input-{}", tool_call.id.0)),
+                            )
+                            .when(is_collapsible, |this| {
+                                this.child(self.render_tool_call_disclosure(
+                                    entry_ix,
+                                    tool_call,
+                                    expansion,
+                                    &card_header_id,
+                                    cx,
+                                ))
+                            }),
                     )
                 } else {
                     this.child(
@@ -10082,35 +10449,13 @@ impl ThreadView {
                                                 .pr_0p5()
                                                 .gap_1()
                                                 .when(is_collapsible, |this| {
-                                                    this.child(
-                                                        Disclosure::new(
-                                                            ("expand-output", entry_ix),
-                                                            is_open,
-                                                        )
-                                                        .opened_icon(IconName::ChevronUp)
-                                                        .closed_icon(IconName::ChevronDown)
-                                                        .visible_on_hover(&card_header_id)
-                                                        .on_click(cx.listener({
-                                                            let id = tool_call.id.clone();
-                                                            move |this: &mut Self,
-                                                                  _,
-                                                                  window,
-                                                                  cx: &mut Context<Self>| {
-                                                                this.entry_view_state.update(
-                                                                    cx,
-                                                                    |state, _cx| {
-                                                                        state
-                                                                            .toggle_tool_call_expansion(
-                                                                                &id,
-                                                                            );
-                                                                    },
-                                                                );
-                                                                this.materialize_tool_call_views(entry_ix, window, cx);
-                                                                this.refresh_thread_search(window, cx);
-                                                                cx.notify();
-                                                            }
-                                                        })),
-                                                    )
+                                                    this.child(self.render_tool_call_disclosure(
+                                                        entry_ix,
+                                                        tool_call,
+                                                        expansion,
+                                                        &card_header_id,
+                                                        cx,
+                                                    ))
                                                 })
                                                 .when(failed_or_canceled, |this| {
                                                     if is_cancelled_edit && !has_diff_changes {
@@ -10234,7 +10579,15 @@ impl ThreadView {
                     )
                 }
             })
-            .children(tool_output_display);
+            .when(
+                !is_open && expansion == ToolCallExpansion::Input && !is_terminal_tool,
+                |this| this.children(self.render_tool_call_input(entry_ix, tool_call, is_edit, window, cx)),
+            )
+            .children(tool_output_display.map(|display| {
+                div()
+                    .debug_selector(|| format!("tool-call-output-{}", tool_call.id.0))
+                    .child(display)
+            }));
 
         v_flex()
             .map(|this| {
