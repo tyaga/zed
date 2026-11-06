@@ -1393,6 +1393,10 @@
     //
     // Default: true
     "expand_terminal_card": true,
+    // Whether to collapse the agent's tool calls, edits and thinking between messages into a one-line summary.
+    //
+    // Default: true
+    "collapse_activity": true,
     // Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     // The command is sent to the shell as if typed, so it is interpreted by your
     // configured shell (including on Windows and remote/WSL projects).

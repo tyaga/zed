@@ -109,6 +109,7 @@ const TOKEN_THRESHOLD: u64 = 250;
 
 pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
+mod activity_group;
 pub(crate) mod elicitation;
 mod message_queue;
 mod subagent_card;
@@ -9516,6 +9517,508 @@ pub(crate) mod tests {
         );
     }
 
+    fn text_block(text: &str) -> acp_v2::ContentBlock {
+        acp_v2::ContentBlock::Text(acp_v2::TextContent::new(text))
+    }
+
+    fn push_tool_call(
+        thread: &Entity<AcpThread>,
+        id: &str,
+        kind: &str,
+        title: &str,
+        status: &str,
+        meta: Option<serde_json::Value>,
+        cx: &mut VisualTestContext,
+    ) {
+        let mut update = json!({"toolCallId": id, "title": title, "kind": kind, "status": status});
+        if let Some(meta) = meta {
+            update["_meta"] = meta;
+        }
+        let update: acp_v2::ToolCallUpdate =
+            serde_json::from_value(update).expect("tool call should deserialize");
+        thread
+            .update(cx, |thread, cx| thread.upsert_wire_tool_call(update, cx))
+            .expect("tool call should apply");
+    }
+
+    #[gpui::test]
+    async fn test_activity_group_classification(cx: &mut TestAppContext) {
+        use super::activity_group::{
+            GroupRole, activity_group_at, activity_summary, current_step_label, group_role,
+        };
+
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, text_block("check the jobs"), cx);
+        });
+        thread.update(cx, |thread, cx| {
+            thread.push_assistant_content_block(text_block("planning"), true, cx);
+        });
+        push_tool_call(
+            &thread,
+            "t1",
+            "execute",
+            "```\nls\n```",
+            "completed",
+            None,
+            cx,
+        );
+        push_tool_call(
+            &thread,
+            "t2",
+            "other",
+            "get_build",
+            "failed",
+            Some(json!({"claudeCode": {"toolName": "mcp__mcp-builds__get_build"}})),
+            cx,
+        );
+        thread.update(cx, |thread, cx| {
+            thread.push_assistant_content_block(text_block("All jobs are green."), false, cx);
+        });
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, cx| {
+            let roles = (0..thread.entries().len())
+                .map(|entry_ix| group_role(thread, entry_ix, cx))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                roles,
+                [
+                    GroupRole::Boundary,
+                    GroupRole::Member,
+                    GroupRole::Member,
+                    GroupRole::Member,
+                    GroupRole::Boundary,
+                ]
+            );
+            let group = activity_group_at(roles.len(), 2, |entry_ix| roles[entry_ix])
+                .expect("tool call belongs to a group");
+            assert_eq!(group.members, 1..4);
+            let summary = activity_summary(thread, &group, cx);
+            assert_eq!(
+                summary.text(),
+                "Called mcp-builds 1 time, ran 1 shell command, thought 1 time"
+            );
+            assert_eq!(summary.failed_count(), 1);
+            assert_eq!(current_step_label(thread, &group, cx), None);
+        });
+
+        push_tool_call(
+            &thread,
+            "t3",
+            "execute",
+            "```\ncargo build\n```",
+            "in_progress",
+            None,
+            cx,
+        );
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, cx| {
+            let entry_count = thread.entries().len();
+            let group = activity_group_at(entry_count, entry_count - 1, |entry_ix| {
+                group_role(thread, entry_ix, cx)
+            })
+            .expect("running tool call belongs to a group");
+            assert_eq!(group.members, 5..6);
+            assert_eq!(
+                current_step_label(thread, &group, cx).as_deref(),
+                Some("cargo build")
+            );
+        });
+    }
+
+    /// Entries: user message, `tool_ids` as completed shell commands, then
+    /// `final_text` as an assistant reply when given.
+    fn push_activity_turn(
+        thread: &Entity<AcpThread>,
+        tool_ids: &[&str],
+        final_text: Option<&str>,
+        cx: &mut VisualTestContext,
+    ) {
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, text_block("check the jobs"), cx);
+        });
+        for tool_id in tool_ids {
+            push_tool_call(
+                thread,
+                tool_id,
+                "execute",
+                &format!("```\necho {tool_id}\n```"),
+                "completed",
+                None,
+                cx,
+            );
+        }
+        if let Some(final_text) = final_text {
+            thread.update(cx, |thread, cx| {
+                thread.push_assistant_content_block(text_block(final_text), false, cx);
+            });
+        }
+        cx.run_until_parked();
+    }
+
+    /// The test window is short and follows the tail of the thread, so the
+    /// activity group would otherwise sit outside the painted viewport. Row 1
+    /// is where every test here starts its group.
+    fn scroll_thread_to_group(thread_view: &Entity<ThreadView>, cx: &mut VisualTestContext) {
+        cx.simulate_resize(size(px(800.), px(2000.)));
+        thread_view.update(cx, |view, cx| {
+            view.list_state.scroll_to(gpui::ListOffset {
+                item_ix: 1,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    fn set_collapse_activity(
+        enabled: bool,
+        thread_view: &Entity<ThreadView>,
+        cx: &mut VisualTestContext,
+    ) {
+        cx.update(|_window, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    collapse_activity: enabled,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        scroll_thread_to_group(thread_view, cx);
+    }
+
+    #[gpui::test]
+    async fn test_activity_group_collapses_to_summary(cx: &mut TestAppContext) {
+        use super::activity_group::ActivityGroup;
+
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        set_collapse_activity(true, &thread_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        push_activity_turn(&thread, &["t1", "t2", "t3"], Some("All green."), cx);
+        scroll_thread_to_group(&thread_view, cx);
+
+        assert!(cx.debug_bounds("activity-summary-1").is_some());
+        assert!(cx.debug_bounds("tool-call-t1-standalone").is_none());
+        assert!(cx.debug_bounds("tool-call-t3-standalone").is_none());
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.toggle_activity_group(
+                ActivityGroup {
+                    members: 1..4,
+                    trailing_thoughts: None,
+                },
+                window,
+                cx,
+            )
+        });
+        scroll_thread_to_group(&thread_view, cx);
+
+        assert!(cx.debug_bounds("activity-summary-1").is_some());
+        assert!(cx.debug_bounds("tool-call-t1-standalone").is_some());
+        assert!(cx.debug_bounds("tool-call-t3-standalone").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_activity_group_shows_pending_permission(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let completed = acp_v1::ToolCall::new(acp_v1::ToolCallId::new("t1"), "List files")
+            .kind(acp_v1::ToolKind::Execute)
+            .status(acp_v1::ToolCallStatus::Completed);
+        let needs_permission =
+            acp_v1::ToolCall::new(acp_v1::ToolCallId::new("t2"), "Run `./deploy.sh`")
+                .kind(acp_v1::ToolKind::Execute);
+        let permission_options =
+            ToolPermissionContext::new(TerminalTool::NAME, vec!["./deploy.sh".to_string()])
+                .build_permission_options();
+        let connection =
+            StubAgentConnection::new().with_permission_requests(HashMap::from_iter([(
+                acp_v2::ToolCallId::new("t2"),
+                permission_options,
+            )]));
+        connection.set_next_prompt_updates(vec![
+            acp_v1::SessionUpdate::ToolCall(completed),
+            acp_v1::SessionUpdate::ToolCall(needs_permission),
+        ]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        cx.update(|_window, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    collapse_activity: true,
+                    notify_when_agent_waiting: NotifyWhenAgentWaiting::Never,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Deploy", window, cx);
+        });
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        scroll_thread_to_group(&thread_view, cx);
+
+        assert!(cx.debug_bounds("activity-summary-1").is_some());
+        assert!(cx.debug_bounds("tool-call-t1-standalone").is_none());
+        assert!(cx.debug_bounds("tool-call-t2-standalone").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_activity_group_disabled_by_setting(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        set_collapse_activity(true, &thread_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        push_activity_turn(&thread, &["t1", "t2"], Some("All green."), cx);
+
+        set_collapse_activity(false, &thread_view, cx);
+        assert!(cx.debug_bounds("activity-summary-1").is_none());
+        assert!(cx.debug_bounds("tool-call-t1-standalone").is_some());
+
+        set_collapse_activity(true, &thread_view, cx);
+        assert!(cx.debug_bounds("activity-summary-1").is_some());
+        assert!(cx.debug_bounds("tool-call-t1-standalone").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_activity_group_hides_last_entry_keeps_controls(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        set_collapse_activity(true, &thread_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        push_activity_turn(&thread, &["t1", "t2"], None, cx);
+
+        assert!(cx.debug_bounds("tool-call-t2-standalone").is_none());
+        assert!(cx.debug_bounds("thread-controls-2").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_activity_group_expands_on_scroll_to_entry(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        set_collapse_activity(true, &thread_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        push_activity_turn(&thread, &["t1", "t2", "t3"], Some("All green."), cx);
+
+        thread_view.update(cx, |view, cx| view.scroll_to_entry(2, cx));
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, cx| {
+            assert!(view.entry_view_state.read(cx).is_activity_group_expanded(1));
+        });
+        assert!(cx.debug_bounds("tool-call-t2-standalone").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_tool_call_three_state_disclosure(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, text_block("list tmp"), cx);
+        });
+        push_tool_call(
+            &thread,
+            "t1",
+            "execute",
+            "```\ncd /tmp\nls -la\n```",
+            "completed",
+            None,
+            cx,
+        );
+        cx.run_until_parked();
+        scroll_thread_to_group(&thread_view, cx);
+
+        let cycle = |cx: &mut VisualTestContext| {
+            thread_view.update(cx, |view, cx| {
+                view.entry_view_state.update(cx, |state, _cx| {
+                    state.cycle_tool_call_expansion(&acp_v2::ToolCallId::new("t1"));
+                });
+                view.list_state.remeasure_items(1..2);
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+
+        assert!(cx.debug_bounds("tool-call-t1-standalone").is_some());
+        assert!(cx.debug_bounds("tool-call-input-t1").is_none());
+        assert!(cx.debug_bounds("tool-call-output-t1").is_none());
+
+        cycle(cx);
+        assert!(cx.debug_bounds("tool-call-input-t1").is_some());
+        assert!(cx.debug_bounds("tool-call-output-t1").is_none());
+
+        cycle(cx);
+        assert!(cx.debug_bounds("tool-call-output-t1").is_some());
+
+        cycle(cx);
+        assert!(cx.debug_bounds("tool-call-input-t1").is_none());
+        assert!(cx.debug_bounds("tool-call-output-t1").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_activity_group_shows_subagent_awaiting_permission(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        cx.update(|_, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    collapse_activity: true,
+                    notify_when_agent_waiting: NotifyWhenAgentWaiting::Never,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        let root_view = active_thread(&conversation_view, cx);
+        let (root, conversation) = root_view.read_with(cx, |view, _| {
+            (view.thread.clone(), view.conversation.clone())
+        });
+        push_activity_turn(&root, &["t1"], None, cx);
+
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        let child_session_id = acp_v2::SessionId::new("collapsed-permission-child");
+        let child_view = conversation_view.update_in(cx, |view, window, cx| {
+            let child = create_test_acp_thread(
+                Some(root_session_id.clone()),
+                child_session_id.0.as_ref(),
+                Rc::new(StubAgentConnection::new()),
+                view.project.clone(),
+                cx,
+            );
+            conversation.update(cx, |conversation, cx| {
+                conversation.register_thread(child.clone(), cx);
+            });
+            let child_view =
+                view.new_thread_view(child, conversation.clone(), false, None, window, cx);
+            view.as_connected_mut()
+                .expect("conversation should be connected")
+                .threads
+                .insert(child_session_id.clone(), child_view.clone());
+            child_view
+        });
+        let child = child_view.read_with(cx, |view, _| view.thread.clone());
+        root.update(cx, |thread, cx| {
+            let mut spawn = acp_v1::ToolCall::new("spawn-child", "Running child")
+                .name("spawn_agent")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::InProgress);
+            spawn.meta = Some(acp_v1::Meta::from_iter([(
+                acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+                serde_json::to_value(acp_thread::SubagentSessionInfo {
+                    session_id: child_session_id.clone(),
+                    message_start_index: 0,
+                    message_end_index: None,
+                })
+                .expect("subagent session info should serialize"),
+            )]));
+            thread
+                .handle_session_update(acp_v1::SessionUpdate::ToolCall(spawn), cx)
+                .expect("running subagent tool should be accepted");
+        });
+        let child_options =
+            ToolPermissionContext::new(TerminalTool::NAME, vec!["cargo build".into()])
+                .build_permission_options();
+        let (_child_request_id, _child_response) =
+            request_test_tool_authorization_with_options(&child, "child-tool", child_options, cx);
+        cx.run_until_parked();
+        scroll_thread_to_group(&root_view, cx);
+
+        assert!(cx.debug_bounds("activity-summary-1").is_some());
+        assert!(cx.debug_bounds("tool-call-t1-standalone").is_none());
+        assert!(
+            cx.debug_bounds("tool-call-spawn-child-standalone")
+                .is_some()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_activity_group_expands_on_search_match(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        set_collapse_activity(true, &thread_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        push_activity_turn(&thread, &["t1", "t2", "t3"], Some("All green."), cx);
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.toggle_search(&crate::ToggleSearch, window, cx);
+        });
+        cx.run_until_parked();
+        let bar = thread_view
+            .read_with(cx, |view, _| view.thread_search_bar.clone())
+            .expect("thread_search_bar should be set after toggle_search");
+        bar.update_in(cx, |bar, window, cx| {
+            bar.query_editor.update(cx, |editor, cx| {
+                editor.set_text("echo t2", window, cx);
+            });
+            bar.update_matches(window, cx);
+        });
+        cx.run_until_parked();
+        bar.update_in(cx, |bar, window, cx| {
+            bar.select_next_match(&super::thread_search_bar::SelectNextThreadMatch, window, cx);
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, cx| {
+            assert!(view.entry_view_state.read(cx).is_activity_group_expanded(1));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_activity_group_keeps_controls_after_thought_only_turn(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        set_collapse_activity(true, &thread_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        push_activity_turn(&thread, &["t1"], None, cx);
+        thread.update(cx, |thread, cx| {
+            thread.push_assistant_content_block(text_block("still thinking"), true, cx);
+        });
+        cx.run_until_parked();
+        scroll_thread_to_group(&thread_view, cx);
+
+        assert!(cx.debug_bounds("activity-summary-1").is_some());
+        assert!(cx.debug_bounds("thread-controls-2").is_some());
+    }
+
     async fn setup_conversation_view(
         agent: impl AgentServer + 'static,
         cx: &mut TestAppContext,
@@ -10913,7 +11416,15 @@ pub(crate) mod tests {
             editor::init(cx);
             agent_panel::init(cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
-            prompt_store::init(cx)
+            prompt_store::init(cx);
+            // Most tests here inspect individual cards; activity-group tests opt in.
+            AgentSettings::override_global(
+                AgentSettings {
+                    collapse_activity: false,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
         });
     }
 
@@ -12407,7 +12918,10 @@ pub(crate) mod tests {
         cx.update(|cx| {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store
-                    .set_user_settings(r#"{ "agent": { "thinking_display": "preview" } }"#, cx)
+                    .set_user_settings(
+                        r#"{ "agent": { "thinking_display": "preview", "collapse_activity": false } }"#,
+                        cx,
+                    )
                     .expect("thinking preview settings");
             });
         });

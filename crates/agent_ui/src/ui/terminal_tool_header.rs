@@ -20,6 +20,7 @@ pub struct TerminalToolHeader {
     hover_group: SharedString,
     working_dir: SharedString,
     is_expanded: bool,
+    disclosure_icon: Option<IconName>,
     elapsed: Option<Duration>,
     running: bool,
     truncated_tooltip: Option<SharedString>,
@@ -46,6 +47,7 @@ impl TerminalToolHeader {
             hover_group: hover_group.into(),
             working_dir: working_dir.into(),
             is_expanded,
+            disclosure_icon: None,
             elapsed: None,
             running: false,
             truncated_tooltip: None,
@@ -59,6 +61,12 @@ impl TerminalToolHeader {
             rounded_top: false,
             rounded_bottom: false,
         }
+    }
+
+    /// Replaces the open/closed chevron when the card has more than two states.
+    pub fn disclosure_icon(mut self, icon: IconName) -> Self {
+        self.disclosure_icon = Some(icon);
+        self
     }
 
     pub fn rounded_corners(mut self, top: bool, bottom: bool) -> Self {
@@ -131,6 +139,7 @@ impl RenderOnce for TerminalToolHeader {
             hover_group,
             working_dir,
             is_expanded,
+            disclosure_icon,
             elapsed,
             running,
             truncated_tooltip,
@@ -173,8 +182,8 @@ impl RenderOnce for TerminalToolHeader {
             )
             .child(
                 Disclosure::new(child_id("disclosure"), is_expanded)
-                    .opened_icon(IconName::ChevronUp)
-                    .closed_icon(IconName::ChevronDown)
+                    .opened_icon(disclosure_icon.unwrap_or(IconName::ChevronUp))
+                    .closed_icon(disclosure_icon.unwrap_or(IconName::ChevronDown))
                     .visible_on_hover(&hover_group)
                     .when_some(on_toggle_expand, |this, handler| this.on_click(handler)),
             )

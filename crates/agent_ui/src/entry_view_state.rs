@@ -53,6 +53,24 @@ enum ToolCallSync {
     Materialize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ToolCallExpansion {
+    #[default]
+    Collapsed,
+    Input,
+    Output,
+}
+
+impl ToolCallExpansion {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Collapsed => Self::Input,
+            Self::Input => Self::Output,
+            Self::Output => Self::Collapsed,
+        }
+    }
+}
+
 pub struct EntryViewState {
     workspace: WeakEntity<Workspace>,
     project: WeakEntity<Project>,
@@ -64,7 +82,9 @@ pub struct EntryViewState {
     auto_expanded_thinking_block: Option<(usize, usize)>,
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
-    expanded_tool_calls: HashSet<acp_v2::ToolCallId>,
+    tool_call_expansions: HashMap<acp_v2::ToolCallId, ToolCallExpansion>,
+    /// Keyed by the first entry of each expanded activity group.
+    expanded_activity_groups: HashSet<usize>,
     /// Subagent cards shown for an ACP parent's outgoing session messages.
     expanded_session_message_cards: HashSet<acp_v2::MessageId>,
 }
@@ -88,13 +108,36 @@ impl EntryViewState {
             auto_expanded_thinking_block: None,
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
-            expanded_tool_calls: HashSet::default(),
+            tool_call_expansions: HashMap::default(),
+            expanded_activity_groups: HashSet::default(),
             expanded_session_message_cards: HashSet::default(),
         }
     }
 
+    pub(crate) fn tool_call_expansion(
+        &self,
+        tool_call_id: &acp_v2::ToolCallId,
+    ) -> ToolCallExpansion {
+        self.tool_call_expansions
+            .get(tool_call_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn cycle_tool_call_expansion(&mut self, tool_call_id: &acp_v2::ToolCallId) {
+        match self.tool_call_expansion(tool_call_id).next() {
+            ToolCallExpansion::Collapsed => {
+                self.tool_call_expansions.remove(tool_call_id);
+            }
+            expansion => {
+                self.tool_call_expansions
+                    .insert(tool_call_id.clone(), expansion);
+            }
+        }
+    }
+
     pub(crate) fn is_tool_call_expanded(&self, tool_call_id: &acp_v2::ToolCallId) -> bool {
-        self.expanded_tool_calls.contains(tool_call_id)
+        self.tool_call_expansion(tool_call_id) == ToolCallExpansion::Output
     }
 
     pub(crate) fn is_tool_call_content_visible(&self, tool_call: &ToolCall) -> bool {
@@ -102,16 +145,30 @@ impl EntryViewState {
     }
 
     pub(crate) fn expand_tool_call(&mut self, tool_call_id: acp_v2::ToolCallId) {
-        self.expanded_tool_calls.insert(tool_call_id);
+        self.tool_call_expansions
+            .insert(tool_call_id, ToolCallExpansion::Output);
     }
 
     pub(crate) fn collapse_tool_call(&mut self, tool_call_id: &acp_v2::ToolCallId) {
-        self.expanded_tool_calls.remove(tool_call_id);
+        self.tool_call_expansions.remove(tool_call_id);
     }
 
     pub(crate) fn toggle_tool_call_expansion(&mut self, tool_call_id: &acp_v2::ToolCallId) {
-        if !self.expanded_tool_calls.remove(tool_call_id) {
-            self.expanded_tool_calls.insert(tool_call_id.clone());
+        if self.is_tool_call_expanded(tool_call_id) {
+            self.tool_call_expansions.remove(tool_call_id);
+        } else {
+            self.tool_call_expansions
+                .insert(tool_call_id.clone(), ToolCallExpansion::Output);
+        }
+    }
+
+    pub(crate) fn is_activity_group_expanded(&self, key: usize) -> bool {
+        self.expanded_activity_groups.contains(&key)
+    }
+
+    pub(crate) fn toggle_activity_group(&mut self, key: usize) {
+        if !self.expanded_activity_groups.remove(&key) {
+            self.expanded_activity_groups.insert(key);
         }
     }
 
@@ -618,6 +675,11 @@ impl EntryViewState {
             .iter()
             .filter_map(|&entry_ix| reindex_after_removal(entry_ix, &range))
             .collect();
+        self.expanded_activity_groups = self
+            .expanded_activity_groups
+            .iter()
+            .filter_map(|&entry_ix| reindex_after_removal(entry_ix, &range))
+            .collect();
         self.expanded_thinking_blocks = self
             .expanded_thinking_blocks
             .iter()
@@ -964,6 +1026,84 @@ mod tests {
         assert_eq!(reindex_after_removal(5, &(2..4)), Some(3));
         // An empty removal range leaves indices untouched.
         assert_eq!(reindex_after_removal(3, &(2..2)), Some(3));
+    }
+
+    fn detached_view_state() -> EntryViewState {
+        EntryViewState::new(
+            gpui::WeakEntity::new_invalid(),
+            gpui::WeakEntity::new_invalid(),
+            None,
+            Arc::new(RwLock::new(SessionCapabilities::default())),
+            "Test Agent".into(),
+        )
+    }
+
+    #[test]
+    fn tool_call_expansion_cycles() {
+        use super::ToolCallExpansion;
+
+        assert_eq!(
+            ToolCallExpansion::Collapsed.next(),
+            ToolCallExpansion::Input
+        );
+        assert_eq!(ToolCallExpansion::Input.next(), ToolCallExpansion::Output);
+        assert_eq!(
+            ToolCallExpansion::Output.next(),
+            ToolCallExpansion::Collapsed
+        );
+    }
+
+    #[test]
+    fn expand_tool_call_sets_output() {
+        use super::ToolCallExpansion;
+
+        let mut state = detached_view_state();
+        let tool_call_id = acp_v2::ToolCallId::new("tool");
+        assert_eq!(
+            state.tool_call_expansion(&tool_call_id),
+            ToolCallExpansion::Collapsed
+        );
+        state.cycle_tool_call_expansion(&tool_call_id);
+        assert_eq!(
+            state.tool_call_expansion(&tool_call_id),
+            ToolCallExpansion::Input
+        );
+        assert!(!state.is_tool_call_expanded(&tool_call_id));
+
+        state.expand_tool_call(tool_call_id.clone());
+        assert_eq!(
+            state.tool_call_expansion(&tool_call_id),
+            ToolCallExpansion::Output
+        );
+        assert!(state.is_tool_call_expanded(&tool_call_id));
+
+        state.cycle_tool_call_expansion(&tool_call_id);
+        assert_eq!(
+            state.tool_call_expansion(&tool_call_id),
+            ToolCallExpansion::Collapsed
+        );
+        assert!(!state.is_tool_call_expanded(&tool_call_id));
+
+        state.toggle_tool_call_expansion(&tool_call_id);
+        assert!(state.is_tool_call_expanded(&tool_call_id));
+        state.toggle_tool_call_expansion(&tool_call_id);
+        assert!(!state.is_tool_call_expanded(&tool_call_id));
+    }
+
+    #[test]
+    fn activity_group_expansion_reindexes_on_remove() {
+        let mut state = detached_view_state();
+        state
+            .entries
+            .extend((0..6).map(|_| Entry::ContextCompaction));
+        state.toggle_activity_group(2);
+        state.toggle_activity_group(5);
+        assert!(state.is_activity_group_expanded(2));
+        state.remove(1..3);
+        assert!(!state.is_activity_group_expanded(2));
+        assert!(state.is_activity_group_expanded(3));
+        state.toggle_activity_group(3);
+        assert!(!state.is_activity_group_expanded(3));
     }
 
     #[gpui::test]
