@@ -121,6 +121,43 @@ const RECENT_COMMIT_COUNT: usize = 3;
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
 const TREE_INDENT: f32 = 16.0;
 const MAX_HISTORY_TAG_CHIPS: usize = 3;
+
+/// Columns of a History row besides the always visible subject and avatar.
+/// Narrow panels drop the author name first, then the date, then the hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HistoryColumns {
+    author: bool,
+    date: bool,
+    sha: bool,
+}
+
+impl HistoryColumns {
+    fn for_list_width(width_in_rems: f32) -> Self {
+        Self {
+            author: width_in_rems >= 30.,
+            date: width_in_rems >= 17.,
+            sha: width_in_rems >= 13.,
+        }
+    }
+}
+
+fn history_entry_description(
+    author_name: &str,
+    formatted_time: &str,
+    short_sha: &str,
+    is_unpushed: bool,
+) -> String {
+    let details = [author_name, formatted_time, short_sha]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" • ");
+    if is_unpushed {
+        format!("Contains Unpushed Changes — {details}")
+    } else {
+        details
+    }
+}
 // Horizontal offset that aligns the tree indent guides with the row icon column.
 const INDENT_GUIDE_LEFT_OFFSET: gpui::Pixels = gpui::px(19.);
 
@@ -8154,8 +8191,14 @@ impl GitPanel {
                         let workspace = workspace;
                         let repo_weak = repo_weak;
                         let git_panel = cx.weak_entity();
+                        let scroll_handle = commit_history_scroll_handle.clone();
                         move |range, window, cx| {
                             let date_style = GitPanelSettings::get_global(cx).date_style;
+                            let list_width =
+                                scroll_handle.0.borrow().base_handle.bounds().size.width;
+                            let columns = HistoryColumns::for_list_width(f32::from(
+                                list_width / window.rem_size(),
+                            ));
                             let visible_data: Vec<Option<Arc<CommitData>>> = repo_weak
                                 .update(cx, |repository, cx| {
                                     entries[range.clone()]
@@ -8227,21 +8270,13 @@ impl GitPanel {
                                     let repo = repo_weak.clone();
                                     let sha_for_click = sha_string;
 
-                                    let dot_separator = || {
-                                        Label::new("•")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted)
-                                            .alpha(0.5)
-                                            .flex_none()
-                                    };
-
-                                    v_flex()
+                                    h_flex()
                                         .id(("commit-history-item", index))
                                         .cursor_pointer()
                                         .w_full()
-                                        .py_1()
+                                        .py_0p5()
                                         .px_2()
-                                        .gap_0p5()
+                                        .gap_2()
                                         .border_1()
                                         .border_color(gpui::transparent_black())
                                         .when(
@@ -8267,7 +8302,7 @@ impl GitPanel {
                                         .child(
                                             h_flex()
                                                 .gap_1()
-                                                .w_full()
+                                                .flex_1()
                                                 .min_w_0()
                                                 .child(Label::new(subject).truncate())
                                                 .children((!tag_names.is_empty()).then(|| {
@@ -8343,50 +8378,51 @@ impl GitPanel {
                                         )
                                         .child(
                                             h_flex()
-                                                .w_full()
+                                                .flex_none()
                                                 .min_w_0()
-                                                .gap_1p5()
+                                                .gap_1()
+                                                .when(columns.author, |this| this.w(rems(7.)))
                                                 .child(div().flex_none().child(avatar))
-                                                .when(!author_name.is_empty(), |this| {
+                                                .when(columns.author, |this| {
                                                     this.child(
-                                                        Label::new(author_name)
+                                                        Label::new(author_name.clone())
                                                             .size(LabelSize::Small)
                                                             .color(Color::Muted)
                                                             .truncate(),
                                                     )
-                                                    .child(dot_separator())
-                                                })
-                                                .when(!formatted_time.is_empty(), |this| {
-                                                    this.child(
-                                                        Label::new(formatted_time)
-                                                            .size(LabelSize::Small)
-                                                            .color(Color::Muted)
-                                                            .flex_none(),
-                                                    )
-                                                    .child(dot_separator())
-                                                })
-                                                .child(
+                                                }),
+                                        )
+                                        .when(columns.date, |this| {
+                                            this.child(
+                                                div().w(rems(6.)).flex_none().min_w_0().child(
+                                                    Label::new(formatted_time.clone())
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Muted)
+                                                        .truncate(),
+                                                ),
+                                            )
+                                        })
+                                        .when(columns.sha, |this| {
+                                            this.child(
+                                                div().w(rems(4.)).flex_none().child(
                                                     Label::new(short_sha.clone())
                                                         .size(LabelSize::Small)
                                                         .color(Color::Muted)
-                                                        .flex_none(),
+                                                        .buffer_font(cx),
                                                 ),
-                                        )
+                                            )
+                                        })
                                         .when(!has_context_menu, |this| {
                                             this.tooltip(move |_, cx| {
-                                                let description = if is_unpushed {
-                                                    SharedString::from(format!(
-                                                        "Contains Unpushed Changes — {}",
-                                                        short_sha.clone(),
-                                                    ))
-                                                } else {
-                                                    short_sha.clone()
-                                                };
-
                                                 Tooltip::with_meta(
                                                     "View Commit Diff",
                                                     None,
-                                                    description,
+                                                    history_entry_description(
+                                                        &author_name,
+                                                        &formatted_time,
+                                                        &short_sha,
+                                                        is_unpushed,
+                                                    ),
                                                     cx,
                                                 )
                                             })
@@ -10766,6 +10802,39 @@ mod tests {
             editor::init(cx);
             crate::init(cx);
         });
+    }
+
+    #[test]
+    fn test_history_columns_drop_author_then_date_then_sha() {
+        let columns = |author, date, sha| HistoryColumns { author, date, sha };
+        assert_eq!(
+            HistoryColumns::for_list_width(40.),
+            columns(true, true, true)
+        );
+        assert_eq!(
+            HistoryColumns::for_list_width(22.),
+            columns(false, true, true)
+        );
+        assert_eq!(
+            HistoryColumns::for_list_width(15.),
+            columns(false, false, true)
+        );
+        assert_eq!(
+            HistoryColumns::for_list_width(10.),
+            columns(false, false, false)
+        );
+    }
+
+    #[test]
+    fn test_history_entry_description() {
+        assert_eq!(
+            history_entry_description("Jane Doe", "2 days ago", "abc1234", false),
+            "Jane Doe • 2 days ago • abc1234"
+        );
+        assert_eq!(
+            history_entry_description("", "", "abc1234", true),
+            "Contains Unpushed Changes — abc1234"
+        );
     }
 
     #[test]
