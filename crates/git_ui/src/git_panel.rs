@@ -13,13 +13,12 @@ use crate::commit_view::CommitView;
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
 use crate::project_diff::{Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
+use crate::repository_tree::{RepositoryTreeRow, RepositoryTreeSource, build_repository_tree};
 use crate::solo_diff_view::SoloDiffView;
 use crate::staged_diff::StagedDiff;
 use crate::unstaged_diff::UnstagedDiff;
 use crate::{branch_picker, picker_prompt, render_remote_button};
-use crate::{
-    git_panel_settings::GitPanelSettings, git_status_icon, repository_selector::RepositorySelector,
-};
+use crate::{git_panel_settings::GitPanelSettings, git_status_icon};
 use agent_settings::{AgentSettings, UserAgentsMd};
 use anyhow::Context as _;
 use askpass::AskPassDelegate;
@@ -96,10 +95,10 @@ use strum::{IntoEnumIterator, VariantNames};
 use theme_settings::ThemeSettings;
 use time::OffsetDateTime;
 use ui::{
-    ButtonLike, Checkbox, Chip, ContextMenu, ContextMenuEntry, Divider, DocumentationSide,
-    ElevationIndex, IndentGuideColors, KeyBinding, PopoverMenu, PopoverMenuHandle,
-    ProjectEmptyState, ScrollAxes, Scrollbars, SplitButton, Tab, TintColor, Tooltip, WithScrollbar,
-    prelude::*,
+    ButtonLike, Checkbox, Chip, ContextMenu, ContextMenuEntry, Disclosure, Divider,
+    DocumentationSide, ElevationIndex, IndentGuideColors, KeyBinding, PopoverMenu,
+    PopoverMenuHandle, ProjectEmptyState, ScrollAxes, Scrollbars, SplitButton, Tab, TintColor,
+    Tooltip, WithScrollbar, prelude::*,
 };
 use util::paths::PathStyle;
 use util::{ResultExt, TryFutureExt, markdown::MarkdownInlineCode, maybe, rel_path::RelPath};
@@ -669,6 +668,8 @@ struct SerializedGitPanel {
     /// `None` means the user never toggled it, so the setting decides.
     #[serde(default)]
     commit_editor_collapsed: Option<bool>,
+    #[serde(default)]
+    repository_tree_collapsed: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -1315,26 +1316,6 @@ struct GitPanelContextMenu {
     _subscription: Subscription,
 }
 
-/// The label for `repository`, disambiguated against every other repository in
-/// the project.
-fn repository_display_name(
-    repository: Option<&Entity<Repository>>,
-    project: &Entity<Project>,
-    cx: &App,
-) -> SharedString {
-    let Some(repository) = repository else {
-        return SharedString::default();
-    };
-    let id = repository.read(cx).id;
-    project
-        .read(cx)
-        .git_store()
-        .read(cx)
-        .display_names(cx)
-        .remove(&id)
-        .unwrap_or_else(|| repository.read(cx).display_name())
-}
-
 pub struct GitPanel {
     pub(crate) active_repository: Option<Entity<Repository>>,
     pub(crate) commit_editor: Entity<Editor>,
@@ -1345,6 +1326,7 @@ pub struct GitPanel {
     /// Set once the user toggles the editor here, so an untouched workspace keeps
     /// following `git_panel.commit_editor` instead of pinning its first value.
     commit_editor_toggled: bool,
+    repository_tree_collapsed: bool,
     conflicted_count: usize,
     conflicted_staged_count: usize,
     add_coauthors: bool,
@@ -1547,6 +1529,9 @@ impl GitPanel {
         let initial_commit_message = active_draft
             .and_then(|draft| draft.message.clone())
             .unwrap_or_default();
+        let repository_tree_collapsed = serialized_panel
+            .as_ref()
+            .is_some_and(|panel| panel.repository_tree_collapsed);
         let pending_commit_message_restores = serialized_panel
             .map(|panel| panel.commit_messages)
             .unwrap_or_default();
@@ -1724,6 +1709,7 @@ impl GitPanel {
                 commit_editor_expanded: false,
                 commit_editor_collapsed,
                 commit_editor_toggled: commit_editor_was_serialized,
+                repository_tree_collapsed,
                 conflicted_count: 0,
                 conflicted_staged_count: 0,
                 add_coauthors: true,
@@ -2279,12 +2265,19 @@ impl GitPanel {
             .map(|id| format!("{}-{:?}", GIT_PANEL_KEY, id))
     }
 
+    fn serialized_panel(&self, cx: &App) -> SerializedGitPanel {
+        SerializedGitPanel {
+            signoff_enabled: self.signoff_enabled,
+            commit_messages: self.serialized_commit_messages(cx),
+            commit_editor_collapsed: self
+                .commit_editor_toggled
+                .then_some(self.commit_editor_collapsed),
+            repository_tree_collapsed: self.repository_tree_collapsed,
+        }
+    }
+
     fn serialize(&mut self, cx: &mut Context<Self>) {
-        let signoff_enabled = self.signoff_enabled;
-        let commit_editor_collapsed = self
-            .commit_editor_toggled
-            .then_some(self.commit_editor_collapsed);
-        let commit_messages = self.serialized_commit_messages(cx);
+        let serialized_panel = self.serialized_panel(cx);
         let kvp = KeyValueStore::global(cx);
 
         self.pending_serialization = cx.spawn(async move |git_panel, cx| {
@@ -2306,15 +2299,8 @@ impl GitPanel {
             };
             cx.background_spawn(
                 async move {
-                    kvp.write_kvp(
-                        serialization_key,
-                        serde_json::to_string(&SerializedGitPanel {
-                            signoff_enabled,
-                            commit_messages,
-                            commit_editor_collapsed,
-                        })?,
-                    )
-                    .await?;
+                    kvp.write_kvp(serialization_key, serde_json::to_string(&serialized_panel)?)
+                        .await?;
                     anyhow::Ok(())
                 }
                 .log_err(),
@@ -7150,6 +7136,204 @@ impl GitPanel {
         cx.notify();
     }
 
+    fn repository_tree_rows(&self, cx: &App) -> Vec<RepositoryTreeRow> {
+        let project = self.project.read(cx);
+        let git_store = project.git_store().read(cx);
+        let loaded = git_store
+            .repositories()
+            .iter()
+            .map(|(id, repository)| (*id, repository.read(cx).work_directory_abs_path.clone()))
+            .collect::<Vec<_>>();
+        let parked = git_store
+            .parked_repositories()
+            .iter()
+            .map(|parked| Arc::from(parked.work_directory_abs_path()))
+            .collect::<Vec<_>>();
+        let worktree_roots = project
+            .visible_worktrees(cx)
+            .map(|worktree| worktree.read(cx).abs_path())
+            .collect::<Vec<_>>();
+        build_repository_tree(&loaded, &parked, &worktree_roots)
+    }
+
+    fn activate_repository_tree_row(&mut self, row: &RepositoryTreeRow, cx: &mut Context<Self>) {
+        let git_store = self.project.read(cx).git_store().clone();
+        match row.source {
+            RepositoryTreeSource::Loaded(id) => {
+                let repository = git_store.read(cx).repositories().get(&id).cloned();
+                if let Some(repository) = repository {
+                    repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+                }
+            }
+            RepositoryTreeSource::Parked => {
+                git_store.update(cx, |git_store, cx| {
+                    git_store.activate_parked_repository(&row.work_directory, cx)
+                });
+            }
+        }
+    }
+
+    fn toggle_repository_tree(&mut self, cx: &mut Context<Self>) {
+        self.repository_tree_collapsed = !self.repository_tree_collapsed;
+        self.serialize(cx);
+        cx.notify();
+    }
+
+    fn render_repository_tree(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let rows = self.repository_tree_rows(cx);
+        if rows.len() <= 1 {
+            return None;
+        }
+        let collapsed = self.repository_tree_collapsed;
+        let active_work_directory = self
+            .active_repository
+            .as_ref()
+            .map(|repository| repository.read(cx).work_directory_abs_path.clone());
+        let row_count = rows.len();
+
+        let header = h_flex()
+            .flex_none()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .child(
+                Disclosure::new("toggle-repository-tree", !collapsed)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_repository_tree(cx))),
+            )
+            .child(Label::new("Repositories").size(LabelSize::Small))
+            .child(
+                Label::new(row_count.to_string())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            );
+
+        let rendered_rows = (!collapsed).then(|| {
+            div()
+                .id("repository-tree-rows")
+                .min_h_0()
+                .overflow_y_scroll()
+                .children(rows.into_iter().enumerate().map(|(index, row)| {
+                    let is_active = active_work_directory.as_ref() == Some(&row.work_directory);
+                    self.render_repository_tree_row(index, row, is_active, cx)
+                }))
+        });
+
+        Some(
+            v_flex()
+                .debug_selector(|| "repository-tree".into())
+                .flex_none()
+                .max_h(relative(1. / 3.))
+                .overflow_hidden()
+                .border_b_1()
+                .border_color(cx.theme().colors().border)
+                .child(header)
+                .children(rendered_rows)
+                .into_any_element(),
+        )
+    }
+
+    fn render_repository_tree_row(
+        &self,
+        index: usize,
+        row: RepositoryTreeRow,
+        is_active: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        const MAX_SHORT_SHA_LEN: usize = 7;
+        let repository = match row.source {
+            RepositoryTreeSource::Loaded(id) => self
+                .project
+                .read(cx)
+                .git_store()
+                .read(cx)
+                .repositories()
+                .get(&id)
+                .cloned(),
+            RepositoryTreeSource::Parked => None,
+        };
+        let is_parked = repository.is_none();
+        let (branch_label, tracking_status, changed_count) = repository
+            .map(|repository| {
+                let repository = repository.read(cx);
+                let branch_label = repository
+                    .branch
+                    .as_ref()
+                    .map(|branch| SharedString::from(branch.name().to_owned()))
+                    .or_else(|| {
+                        repository.head_commit.as_ref().map(|commit| {
+                            commit
+                                .sha
+                                .chars()
+                                .take(MAX_SHORT_SHA_LEN)
+                                .collect::<String>()
+                                .into()
+                        })
+                    });
+                let tracking_status = repository
+                    .branch
+                    .as_ref()
+                    .and_then(|branch| branch.upstream.as_ref())
+                    .and_then(|upstream| upstream.tracking.status())
+                    .filter(|status| status.ahead > 0 || status.behind > 0);
+                let changed_count = repository.statuses_by_path.summary().item_summary.count;
+                (branch_label, tracking_status, changed_count)
+            })
+            .unwrap_or_default();
+        let name_color = if is_parked {
+            Color::Muted
+        } else {
+            Color::Default
+        };
+
+        h_flex()
+            .id(("repository-tree-row", index))
+            .w_full()
+            .py_0p5()
+            .pr_2()
+            .pl(px(8. + 12. * row.depth as f32))
+            .gap_1()
+            .cursor_pointer()
+            .when(is_active, |this| {
+                this.bg(cx.theme().colors().element_selected)
+            })
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .child(
+                Label::new(row.name.clone())
+                    .size(LabelSize::Small)
+                    .color(name_color)
+                    .truncate(),
+            )
+            .children(row.relative_path.clone().map(|relative_path| {
+                Label::new(relative_path)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate()
+            }))
+            .child(div().flex_1())
+            .children(branch_label.map(|branch_label| {
+                Label::new(branch_label)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate()
+            }))
+            .children(tracking_status.map(|status| {
+                Label::new(format!("↑{} ↓{}", status.ahead, status.behind))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+            }))
+            .when(changed_count > 0, |this| {
+                this.child(
+                    Label::new(changed_count.to_string())
+                        .size(LabelSize::Small)
+                        .color(Color::Modified),
+                )
+            })
+            .on_click(
+                cx.listener(move |this, _, _, cx| this.activate_repository_tree_row(&row, cx)),
+            )
+            .into_any_element()
+    }
+
     fn expand_commit_editor(
         &mut self,
         _: &ExpandCommitEditor,
@@ -7374,7 +7558,6 @@ impl GitPanel {
         let head_commit = active_repository.read(cx).head_commit.clone();
 
         let git_panel = cx.entity();
-        let display_name = repository_display_name(Some(&active_repository), &self.project, cx);
         let editor_is_long = self.commit_editor.update(cx, |editor, cx| {
             editor.max_point(cx).row().0 >= MAX_PANEL_EDITOR_LINES as u32
         });
@@ -7466,12 +7649,7 @@ impl GitPanel {
 
         let footer = v_flex()
             .when(self.commit_editor_expanded, |this| this.flex_1().min_h_0())
-            .child(PanelRepoFooter::new(
-                display_name,
-                branch,
-                head_commit,
-                Some(git_panel),
-            ))
+            .child(PanelRepoFooter::new(branch, head_commit, Some(git_panel)))
             .when(title_exceeds_limit, |this| {
                 this.child(
                     h_flex()
@@ -10096,7 +10274,8 @@ impl Render for GitPanel {
                 v_flex()
                     .size_full()
                     .when(!self.commit_editor_expanded, |this| {
-                        this.child(self.render_tab_bar(cx))
+                        this.children(self.render_repository_tree(cx))
+                            .child(self.render_tab_bar(cx))
                     })
                     .map(|this| match self.active_tab {
                         GitPanelTab::Changes => this
@@ -10346,7 +10525,6 @@ impl Render for GitPanelMessageTooltip {
 
 #[derive(IntoElement, RegisterComponent)]
 pub struct PanelRepoFooter {
-    active_repository: SharedString,
     branch: Option<Branch>,
     head_commit: Option<CommitDetails>,
 
@@ -10358,22 +10536,19 @@ pub struct PanelRepoFooter {
 
 impl PanelRepoFooter {
     pub fn new(
-        active_repository: SharedString,
         branch: Option<Branch>,
         head_commit: Option<CommitDetails>,
         git_panel: Option<Entity<GitPanel>>,
     ) -> Self {
         Self {
-            active_repository,
             branch,
             head_commit,
             git_panel,
         }
     }
 
-    pub fn new_preview(active_repository: SharedString, branch: Option<Branch>) -> Self {
+    pub fn new_preview(branch: Option<Branch>) -> Self {
         Self {
-            active_repository,
             branch,
             head_commit: None,
             git_panel: None,
@@ -10417,37 +10592,6 @@ impl RenderOnce for PanelRepoFooter {
                 })
             })
             .unwrap_or_else(|| " (no branch)".to_owned());
-        let show_separator = self.branch.is_some() || self.head_commit.is_some();
-
-        let active_repo_name = self.active_repository.clone();
-
-        let repo_selector = PopoverMenu::new("repository-switcher")
-            .menu({
-                let project = project;
-                move |window, cx| {
-                    let project = project.clone()?;
-                    Some(cx.new(|cx| RepositorySelector::new(project, rems(20.), window, cx)))
-                }
-            })
-            .trigger_with_tooltip(
-                Button::new("repo-selector", active_repo_name)
-                    .size(ButtonSize::None)
-                    .label_size(LabelSize::Small)
-                    .truncate(true),
-                move |_, cx| {
-                    if single_repo {
-                        cx.new(|_| Empty).into()
-                    } else {
-                        Tooltip::simple("Switch Active Repository", cx)
-                    }
-                },
-            )
-            .anchor(Anchor::BottomLeft)
-            .offset(gpui::Point {
-                x: px(0.0),
-                y: px(-2.0),
-            })
-            .into_any_element();
 
         let branch_selector_button = Button::new("branch-selector", branch_name)
             .size(ButtonSize::None)
@@ -10491,16 +10635,6 @@ impl RenderOnce for PanelRepoFooter {
                             Color::Muted
                         },
                     ))
-                    .when(!single_repo, |this| {
-                        this.child(div().child(repo_selector).min_w_0()).when(
-                            show_separator,
-                            |this| {
-                                this.child(Label::new("/").size(LabelSize::Small).color(
-                                    Color::Custom(cx.theme().colors().text_muted.opacity(0.4)),
-                                ))
-                            },
-                        )
-                    })
                     .child(div().child(branch_selector).min_w_0()),
             )
             .children(if let Some(git_panel) = self.git_panel {
@@ -10589,10 +10723,6 @@ impl Component for PanelRepoFooter {
             }
         }
 
-        fn active_repository(id: usize) -> SharedString {
-            format!("repo-{}", id).into()
-        }
-
         let example_width = px(340.);
 
         v_flex()
@@ -10608,7 +10738,7 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(active_repository(1), None))
+                                .child(PanelRepoFooter::new_preview(None))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -10616,10 +10746,7 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    active_repository(2),
-                                    Some(branch(unknown_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(branch(unknown_upstream))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -10627,10 +10754,9 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    active_repository(3),
-                                    Some(branch(no_remote_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(branch(
+                                    no_remote_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -10638,10 +10764,9 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    active_repository(4),
-                                    Some(branch(not_ahead_or_behind_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(branch(
+                                    not_ahead_or_behind_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -10649,10 +10774,7 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    active_repository(5),
-                                    Some(branch(behind_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(branch(behind_upstream))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -10660,10 +10782,9 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    active_repository(6),
-                                    Some(branch(ahead_of_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(branch(
+                                    ahead_of_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -10671,10 +10792,9 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    active_repository(7),
-                                    Some(branch(ahead_and_behind_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(branch(
+                                    ahead_and_behind_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                     ],
@@ -10687,14 +10807,14 @@ impl Component for PanelRepoFooter {
                     "Labels",
                     vec![
                         single_example(
-                            "Short Branch & Repo",
+                            "Short Branch",
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    SharedString::from("zed"),
-                                    Some(custom("main", behind_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(custom(
+                                    "main",
+                                    behind_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -10702,49 +10822,10 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    SharedString::from("zed"),
-                                    Some(custom(
-                                        "redesign-and-update-git-ui-list-entry-style",
-                                        behind_upstream,
-                                    )),
-                                ))
-                                .into_any_element(),
-                        ),
-                        single_example(
-                            "Long Repo",
-                            div()
-                                .w(example_width)
-                                .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    SharedString::from("zed-industries-community-examples"),
-                                    Some(custom("gpui", ahead_of_upstream)),
-                                ))
-                                .into_any_element(),
-                        ),
-                        single_example(
-                            "Long Repo & Branch",
-                            div()
-                                .w(example_width)
-                                .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    SharedString::from("zed-industries-community-examples"),
-                                    Some(custom(
-                                        "redesign-and-update-git-ui-list-entry-style",
-                                        behind_upstream,
-                                    )),
-                                ))
-                                .into_any_element(),
-                        ),
-                        single_example(
-                            "Uppercase Repo",
-                            div()
-                                .w(example_width)
-                                .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    SharedString::from("LICENSES"),
-                                    Some(custom("main", ahead_of_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(custom(
+                                    "redesign-and-update-git-ui-list-entry-style",
+                                    behind_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                         single_example(
@@ -10752,10 +10833,10 @@ impl Component for PanelRepoFooter {
                             div()
                                 .w(example_width)
                                 .overflow_hidden()
-                                .child(PanelRepoFooter::new_preview(
-                                    SharedString::from("zed"),
-                                    Some(custom("update-README", behind_upstream)),
-                                ))
+                                .child(PanelRepoFooter::new_preview(Some(custom(
+                                    "update-README",
+                                    behind_upstream,
+                                ))))
                                 .into_any_element(),
                         ),
                     ],
@@ -10778,13 +10859,14 @@ mod tests {
         repository::repo_path,
         status::{StatusCode, TrackedStatus, UnmergedStatus, UnmergedStatusCode},
     };
-    use gpui::{Modifiers, TestAppContext, UpdateGlobal, VisualTestContext, px};
+    use gpui::{Modifiers, TestAppContext, UpdateGlobal, VisualTestContext, point, px};
     use indoc::indoc;
     use project::FakeFs;
     use search::{BufferSearchBar, buffer_search::Deploy};
     use serde_json::json;
     use settings::SettingsStore;
     use std::any::TypeId;
+    use std::path::PathBuf;
     use theme::LoadThemes;
     use util::path;
     use util::rel_path::rel_path;
@@ -13754,6 +13836,7 @@ mod tests {
                 signoff_enabled: false,
                 commit_messages: panel.serialized_commit_messages(cx),
                 commit_editor_collapsed: None,
+                repository_tree_collapsed: false,
             }
         });
 
@@ -13798,6 +13881,7 @@ mod tests {
         let mismatched_serialized_panel = SerializedGitPanel {
             signoff_enabled: false,
             commit_editor_collapsed: None,
+            repository_tree_collapsed: false,
             commit_messages: BTreeMap::from_iter([(
                 path!("/root/other-project").to_string(),
                 SerializedCommitMessage {
@@ -13897,6 +13981,7 @@ mod tests {
             signoff_enabled: false,
             commit_messages: panel.serialized_commit_messages(cx),
             commit_editor_collapsed: None,
+            repository_tree_collapsed: false,
         });
         let buffer = repository.read_with(cx, |repository, _| {
             repository.commit_message_buffer().unwrap().clone()
@@ -13993,6 +14078,7 @@ mod tests {
             signoff_enabled: false,
             commit_messages: panel.serialized_commit_messages(cx),
             commit_editor_collapsed: None,
+            repository_tree_collapsed: false,
         });
 
         // Simulate a restart and restore from the serialized state.
@@ -18700,5 +18786,164 @@ mod tests {
         });
         settle_branch_mode(cx);
         assert!(base_picker_open(&test.workspace, cx));
+    }
+
+    fn repository_tree_fixture() -> serde_json::Value {
+        json!({
+            "one": { ".git": {}, "a.txt": "" },
+            "two": { ".git": {}, "b.txt": "" },
+            "nested": {
+                "deep": {
+                    "three": { ".git": {}, "src": { "c.txt": "" } }
+                }
+            }
+        })
+    }
+
+    fn active_repository_path(project: &Entity<Project>, cx: &mut VisualTestContext) -> PathBuf {
+        project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .map(|repository| repository.read(cx).work_directory_abs_path.to_path_buf())
+                .unwrap_or_default()
+        })
+    }
+
+    fn repository_tree_row(
+        panel: &Entity<GitPanel>,
+        name: &str,
+        cx: &mut VisualTestContext,
+    ) -> RepositoryTreeRow {
+        panel.read_with(cx, |panel, cx| {
+            panel
+                .repository_tree_rows(cx)
+                .into_iter()
+                .find(|row| row.name.as_ref() == name)
+                .unwrap()
+        })
+    }
+
+    #[gpui::test]
+    async fn test_repository_tree_lists_all_repositories(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/project"), repository_tree_fixture())
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+        cx.run_until_parked();
+
+        let rows = panel.read_with(cx, |panel, cx| panel.repository_tree_rows(cx));
+        let names = rows.iter().map(|row| row.name.as_ref()).collect::<Vec<_>>();
+        assert_eq!(names, ["three", "one", "two"]);
+        assert_eq!(rows[0].source, RepositoryTreeSource::Parked);
+        assert!(matches!(rows[1].source, RepositoryTreeSource::Loaded(_)));
+        assert!(matches!(rows[2].source, RepositoryTreeSource::Loaded(_)));
+
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(400.), px(800.)),
+            |_, _| panel.clone().into_any_element(),
+        );
+        assert!(cx.debug_bounds("repository-tree").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_repository_tree_row_click_switches_active_repository(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/project"), repository_tree_fixture())
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+        cx.run_until_parked();
+
+        let two = repository_tree_row(&panel, "two", cx);
+        panel.update(cx, |panel, cx| panel.activate_repository_tree_row(&two, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            active_repository_path(&project, cx),
+            PathBuf::from(path!("/project/two"))
+        );
+
+        let three = repository_tree_row(&panel, "three", cx);
+        panel.update(cx, |panel, cx| {
+            panel.activate_repository_tree_row(&three, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            active_repository_path(&project, cx),
+            PathBuf::from(path!("/project/nested/deep/three"))
+        );
+        let three = repository_tree_row(&panel, "three", cx);
+        assert!(matches!(three.source, RepositoryTreeSource::Loaded(_)));
+    }
+
+    #[gpui::test]
+    async fn test_repository_tree_hidden_for_single_repository(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ "one": { ".git": {}, "a.txt": "" } }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+        cx.run_until_parked();
+
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(400.), px(800.)),
+            |_, _| panel.clone().into_any_element(),
+        );
+        assert!(cx.debug_bounds("repository-tree").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_repository_tree_collapsed_state_is_serialized(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/project"), repository_tree_fixture())
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| panel.toggle_repository_tree(cx));
+        let serialized = panel.read_with(cx, |panel, cx| {
+            serde_json::to_string(&panel.serialized_panel(cx)).unwrap()
+        });
+        let serialized_panel = serde_json::from_str::<SerializedGitPanel>(&serialized).unwrap();
+
+        let restored_panel = workspace.update_in(cx, |workspace, window, cx| {
+            GitPanel::new_with_serialized_panel(workspace, Some(serialized_panel), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(restored_panel.read_with(cx, |panel, _| panel.repository_tree_collapsed));
     }
 }
