@@ -10,7 +10,8 @@ use futures::io::BufReader;
 use futures::stream::BoxStream;
 use futures::{AsyncBufReadExt as _, AsyncWriteExt as _, FutureExt as _, StreamExt as _};
 use gpui::{
-    AnyView, App, AppContext as _, AsyncApp, BackgroundExecutor, Render, Task, Window, div,
+    AnyView, App, AppContext as _, AsyncApp, BackgroundExecutor, Render, SharedString, Task,
+    Window, div,
 };
 use language_model::{
     AuthenticateError, InlineDescription, InlineProviderSettings, LanguageModel,
@@ -216,6 +217,8 @@ pub(crate) fn parse_claude_code_line(line: &str) -> ClaudeCodeLine {
 const MAX_TOKEN_COUNT: u64 = 200_000;
 const STDERR_TAIL_LINES: usize = 20;
 const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const BINARY_NOT_FOUND_MESSAGE: &str =
+    "`claude` not found. Install Claude Code or set language_models.claude_code.path.";
 const SIGN_IN_MESSAGE: &str =
     "Claude Code is not signed in. Run `claude` in a terminal and sign in.";
 
@@ -329,10 +332,7 @@ impl LanguageModelProvider for ClaudeCodeProvider {
     fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView> {
         let description = match claude_binary(cx) {
             Some(binary) => format!("Uses {}", binary.display()),
-            None => {
-                "`claude` not found — install Claude Code or set language_models.claude_code.path"
-                    .to_string()
-            }
+            None => BINARY_NOT_FOUND_MESSAGE.to_string(),
         };
         Some(ProviderSettingsView::Inline(InlineProviderSettings {
             title: Some(PROVIDER_NAME.0),
@@ -341,6 +341,14 @@ impl LanguageModelProvider for ClaudeCodeProvider {
                 cx.new(|_| ConfigurationView).into()
             }),
         }))
+    }
+
+    fn authentication_error_message(&self) -> SharedString {
+        SIGN_IN_MESSAGE.into()
+    }
+
+    fn missing_credentials_error_message(&self) -> SharedString {
+        BINARY_NOT_FOUND_MESSAGE.into()
     }
 }
 
@@ -379,6 +387,17 @@ impl LanguageModelClient for ClaudeCodeProvider {
             Ok(process.into_events())
         }
         .boxed()
+    }
+}
+
+async fn wait_for_stderr_tail(
+    stderr_tail: Task<VecDeque<String>>,
+    executor: &BackgroundExecutor,
+) -> Vec<String> {
+    let timeout = executor.timer(STDERR_DRAIN_TIMEOUT);
+    futures::select_biased! {
+        tail = stderr_tail.fuse() => tail.into(),
+        _ = timeout.fuse() => Vec::new(),
     }
 }
 
@@ -429,20 +448,29 @@ impl ClaudeCodeProcess {
         // pipe while stdout is being read.
         let stderr_tail = executor.spawn(async move {
             let mut tail = VecDeque::with_capacity(STDERR_TAIL_LINES);
-            let mut lines = BufReader::new(stderr).lines();
-            while let Some(Ok(line)) = lines.next().await {
+            let mut stderr = BufReader::new(stderr);
+            let mut line = Vec::new();
+            // Lines are read as bytes so a non-UTF-8 line does not stop the
+            // draining and leave the CLI blocked on a full stderr pipe.
+            while matches!(stderr.read_until(b'\n', &mut line).await, Ok(read) if read > 0) {
                 if tail.len() == STDERR_TAIL_LINES {
                     tail.pop_front();
                 }
-                tail.push_back(line);
+                tail.push_back(String::from_utf8_lossy(&line).trim_end().to_string());
+                line.clear();
             }
             tail
         });
 
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .context("failed to send the prompt to Claude Code")?;
+        if let Err(error) = stdin.write_all(prompt.as_bytes()).await {
+            let tail = wait_for_stderr_tail(stderr_tail, &executor)
+                .await
+                .join("\n");
+            log::warn!("failed to send the prompt to Claude Code: {error}. Stderr:\n{tail}");
+            return Err(anyhow::Error::new(error).context(format!(
+                "failed to send the prompt to Claude Code. Stderr:\n{tail}"
+            )));
+        }
         drop(stdin);
 
         Ok(Self {
@@ -455,11 +483,7 @@ impl ClaudeCodeProcess {
     }
 
     async fn stderr_tail(self) -> Vec<String> {
-        let timeout = self.executor.timer(STDERR_DRAIN_TIMEOUT);
-        futures::select_biased! {
-            tail = self.stderr_tail.fuse() => tail.into(),
-            _ = timeout.fuse() => Vec::new(),
-        }
+        wait_for_stderr_tail(self.stderr_tail, &self.executor).await
     }
 
     fn into_events(self) -> LanguageModelCompletionStream {
@@ -861,6 +885,22 @@ mod tests {
         assert!(matches!(
             events[1],
             Err(LanguageModelCompletionError::StreamEndedUnexpectedly { .. })
+        ));
+    }
+
+    #[gpui::test]
+    async fn test_missing_binary_messages(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = init_provider(&directory.path().join("missing/claude"), cx);
+
+        assert!(
+            provider
+                .missing_credentials_error_message()
+                .contains("claude")
+        );
+        assert!(matches!(
+            cx.update(|cx| provider.authenticate(cx)).await,
+            Err(AuthenticateError::CredentialsNotFound)
         ));
     }
 
