@@ -2793,3 +2793,149 @@ mod repository_activation_tests {
         });
     }
 }
+
+mod diff_base_override_tests {
+    use std::path::Path;
+
+    use fs::FakeFs;
+    use gpui::{BorrowAppContext, SharedString, TestAppContext};
+    use project::{
+        Project,
+        git_store::{GitStoreEvent, diff_buffer_list::DiffBase},
+    };
+    use serde_json::json;
+    use settings::{GitDiffBaseSetting, SettingsStore};
+    use util::path;
+
+    async fn setup(cx: &mut TestAppContext) -> gpui::Entity<Project> {
+        zlog::init_test();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "file.rs": "worktree\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("file.rs", "head\n".to_string())],
+        );
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        project
+    }
+
+    fn set_diff_base(cx: &mut TestAppContext, setting: GitDiffBaseSetting) {
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git.get_or_insert_default().diff_base = Some(setting);
+                });
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    fn display_base(project: &gpui::Entity<Project>, cx: &mut TestAppContext) -> Option<DiffBase> {
+        project.read_with(cx, |project, cx| {
+            let git_store = project.git_store().read(cx);
+            let repo_id = git_store.active_repository()?.read(cx).id;
+            let buffers = git_store.display_diff_for_repo(repo_id)?;
+            Some(buffers.read(cx).diff_base().clone())
+        })
+    }
+
+    #[gpui::test]
+    async fn test_diff_base_override_replaces_default_branch(cx: &mut TestAppContext) {
+        let project = setup(cx).await;
+        set_diff_base(cx, GitDiffBaseSetting::DefaultBranch);
+        assert_eq!(
+            display_base(&project, cx),
+            Some(DiffBase::Merge {
+                base_ref: "origin/main".into()
+            })
+        );
+
+        let git_store = project.read_with(cx, |project, _| project.git_store().clone());
+        let repo_id = git_store.read_with(cx, |git_store, cx| {
+            git_store
+                .active_repository()
+                .expect("repository should be detected")
+                .read(cx)
+                .id
+        });
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let events = events.clone();
+            cx.subscribe(&git_store, move |_, event: &GitStoreEvent, _| {
+                if let GitStoreEvent::DiffBaseChanged(id) = event {
+                    events.borrow_mut().push(*id);
+                }
+            })
+        });
+
+        git_store.update(cx, |git_store, cx| {
+            git_store.set_diff_base_override(
+                repo_id,
+                Some(SharedString::from("origin/release")),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            display_base(&project, cx),
+            Some(DiffBase::Merge {
+                base_ref: "origin/release".into()
+            })
+        );
+        assert!(events.borrow().contains(&Some(repo_id)));
+        git_store.read_with(cx, |git_store, _| {
+            assert_eq!(
+                git_store.diff_base_override(repo_id).map(|r| r.as_ref()),
+                Some("origin/release")
+            );
+        });
+
+        git_store.update(cx, |git_store, cx| {
+            git_store.set_diff_base_override(repo_id, None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            display_base(&project, cx),
+            Some(DiffBase::Merge {
+                base_ref: "origin/main".into()
+            })
+        );
+    }
+
+    #[gpui::test]
+    async fn test_diff_base_override_ignored_for_head(cx: &mut TestAppContext) {
+        let project = setup(cx).await;
+        set_diff_base(cx, GitDiffBaseSetting::Head);
+        let git_store = project.read_with(cx, |project, _| project.git_store().clone());
+        let repo_id = git_store.read_with(cx, |git_store, cx| {
+            git_store
+                .active_repository()
+                .expect("repository should be detected")
+                .read(cx)
+                .id
+        });
+        git_store.update(cx, |git_store, cx| {
+            git_store.set_diff_base_override(
+                repo_id,
+                Some(SharedString::from("origin/release")),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(display_base(&project, cx), None);
+    }
+}

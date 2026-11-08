@@ -69,6 +69,24 @@ impl Addon for BranchDiffAddon {
     }
 }
 
+/// Opens, or focuses, the diff of the active repository against `base_ref`.
+pub fn open_branch_diff(
+    workspace: &mut Workspace,
+    base_ref: SharedString,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Result<()> {
+    let project = workspace.project().clone();
+    let repository = project
+        .read(cx)
+        .active_repository(cx)
+        .context("No active repository")?;
+    BranchDiff::deploy_branch_diff_with_base_ref(
+        workspace, project, repository, base_ref, None, None, window, cx,
+    );
+    Ok(())
+}
+
 impl BranchDiff {
     pub(crate) fn register(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
         workspace.register_action(|workspace, _: &DeployBranchDiff, window, cx| {

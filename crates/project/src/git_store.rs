@@ -108,6 +108,7 @@ pub struct GitStore {
     parked_repositories: Vec<ParkedRepository>,
     diff_base: GitDiffBaseSetting,
     display_diffs: HashMap<RepositoryId, DisplayDiff>,
+    diff_base_overrides: HashMap<RepositoryId, SharedString>,
     worktree_ids: HashMap<RepositoryId, HashSet<WorktreeId>>,
     active_repo_id: Option<RepositoryId>,
     #[allow(clippy::type_complexity)]
@@ -1042,6 +1043,7 @@ impl GitStore {
             parked_repositories: Vec::new(),
             diff_base: diff_base_setting,
             display_diffs: HashMap::default(),
+            diff_base_overrides: HashMap::default(),
             worktree_ids: HashMap::default(),
             active_repo_id: None,
             _subscriptions,
@@ -2457,6 +2459,7 @@ impl GitStore {
 
                 for repo_id in &repos_without_worktree {
                     self.display_diffs.remove(repo_id);
+                    self.diff_base_overrides.remove(repo_id);
                     self.repositories.remove(repo_id);
                     self.worktree_ids.remove(repo_id);
                     if let Some(updates_tx) =
@@ -2680,6 +2683,7 @@ impl GitStore {
                 cx.emit(GitStoreEvent::ActiveRepositoryChanged(None));
             }
             self.display_diffs.remove(&id);
+            self.diff_base_overrides.remove(&id);
             self.repositories.remove(&id);
             if let Some(updates_tx) = updates_tx.as_ref() {
                 updates_tx
@@ -3453,6 +3457,7 @@ impl GitStore {
             let mut update = envelope.payload;
             let id = RepositoryId::from_proto(update.id);
             this.display_diffs.remove(&id);
+            this.diff_base_overrides.remove(&id);
             this.repositories.remove(&id);
             if let Some((client, project_id)) = this.downstream_client() {
                 update.project_id = project_id.to_proto();
@@ -5033,6 +5038,29 @@ impl GitStore {
         cx.emit(GitStoreEvent::DiffBaseChanged(None));
     }
 
+    /// Replaces the default branch as the display diff base of `repo_id` while
+    /// `diff_base` is `default_branch`; `None` restores the default branch.
+    pub fn set_diff_base_override(
+        &mut self,
+        repo_id: RepositoryId,
+        base_ref: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = match base_ref {
+            Some(base_ref) => {
+                self.diff_base_overrides.insert(repo_id, base_ref.clone()) != Some(base_ref)
+            }
+            None => self.diff_base_overrides.remove(&repo_id).is_some(),
+        };
+        if changed && self.diff_base == GitDiffBaseSetting::DefaultBranch {
+            self.refresh_diff_base_for_repo(repo_id, cx);
+        }
+    }
+
+    pub fn diff_base_override(&self, repo_id: RepositoryId) -> Option<&SharedString> {
+        self.diff_base_overrides.get(&repo_id)
+    }
+
     pub fn display_status_for_buffer_id(
         &self,
         buffer_id: BufferId,
@@ -5131,9 +5159,12 @@ impl GitStore {
             return;
         };
 
+        let base_override = self.diff_base_overrides.get(&repo_id).cloned();
         let task = cx.spawn(async move |this, cx| {
-            let result: Result<Option<SharedString>> =
-                async { repo.update(cx, |repo, _| repo.default_branch(true)).await? }.await;
+            let result: Result<Option<SharedString>> = match base_override {
+                Some(base_ref) => Ok(Some(base_ref)),
+                None => async { repo.update(cx, |repo, _| repo.default_branch(true)).await? }.await,
+            };
             this.update(cx, |this, cx| {
                 let Some(state) = this.display_diffs.get_mut(&repo_id) else {
                     return;
