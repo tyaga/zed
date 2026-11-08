@@ -13,7 +13,10 @@ use crate::commit_view::CommitView;
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
 use crate::project_diff::{Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
-use crate::repository_tree::{RepositoryTreeRow, RepositoryTreeSource, build_repository_tree};
+use crate::repository_tree::{
+    RepositoryTreeEntry, RepositoryTreeRow, RepositoryTreeSource, build_repository_tree,
+    visible_repository_tree_rows,
+};
 use crate::solo_diff_view::SoloDiffView;
 use crate::staged_diff::StagedDiff;
 use crate::unstaged_diff::UnstagedDiff;
@@ -756,6 +759,8 @@ struct SerializedGitPanel {
     commit_editor_collapsed: Option<bool>,
     #[serde(default)]
     repository_tree_collapsed: bool,
+    #[serde(default)]
+    collapsed_repository_tree_paths: Vec<std::path::PathBuf>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -1413,6 +1418,7 @@ pub struct GitPanel {
     /// following `git_panel.commit_editor` instead of pinning its first value.
     commit_editor_toggled: bool,
     repository_tree_collapsed: bool,
+    collapsed_repository_tree_paths: HashSet<Arc<Path>>,
     conflicted_count: usize,
     conflicted_staged_count: usize,
     add_coauthors: bool,
@@ -1639,6 +1645,16 @@ impl GitPanel {
         let repository_tree_collapsed = serialized_panel
             .as_ref()
             .is_some_and(|panel| panel.repository_tree_collapsed);
+        let collapsed_repository_tree_paths = serialized_panel
+            .as_ref()
+            .map(|panel| {
+                panel
+                    .collapsed_repository_tree_paths
+                    .iter()
+                    .map(|path| Arc::from(path.as_path()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let pending_commit_message_restores = serialized_panel
             .map(|panel| panel.commit_messages)
             .unwrap_or_default();
@@ -1830,6 +1846,7 @@ impl GitPanel {
                 commit_editor_collapsed,
                 commit_editor_toggled: commit_editor_was_serialized,
                 repository_tree_collapsed,
+                collapsed_repository_tree_paths,
                 conflicted_count: 0,
                 conflicted_staged_count: 0,
                 add_coauthors: true,
@@ -2397,6 +2414,11 @@ impl GitPanel {
                 .commit_editor_toggled
                 .then_some(self.commit_editor_collapsed),
             repository_tree_collapsed: self.repository_tree_collapsed,
+            collapsed_repository_tree_paths: self
+                .collapsed_repository_tree_paths
+                .iter()
+                .map(|path| path.to_path_buf())
+                .collect(),
         }
     }
 
@@ -7284,19 +7306,28 @@ impl GitPanel {
 
     fn activate_repository_tree_row(&mut self, row: &RepositoryTreeRow, cx: &mut Context<Self>) {
         let git_store = self.project.read(cx).git_store().clone();
-        match row.source {
-            RepositoryTreeSource::Loaded(id) => {
+        match row.entry {
+            RepositoryTreeEntry::Folder => self.toggle_repository_tree_row(&row.path, cx),
+            RepositoryTreeEntry::Repository(RepositoryTreeSource::Loaded(id)) => {
                 let repository = git_store.read(cx).repositories().get(&id).cloned();
                 if let Some(repository) = repository {
                     repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
                 }
             }
-            RepositoryTreeSource::Parked => {
+            RepositoryTreeEntry::Repository(RepositoryTreeSource::Parked) => {
                 git_store.update(cx, |git_store, cx| {
-                    git_store.activate_parked_repository(&row.work_directory, cx)
+                    git_store.activate_parked_repository(&row.path, cx)
                 });
             }
         }
+    }
+
+    fn toggle_repository_tree_row(&mut self, path: &Arc<Path>, cx: &mut Context<Self>) {
+        if !self.collapsed_repository_tree_paths.remove(path) {
+            self.collapsed_repository_tree_paths.insert(path.clone());
+        }
+        self.serialize(cx);
+        cx.notify();
     }
 
     fn toggle_repository_tree(&mut self, cx: &mut Context<Self>) {
@@ -7311,7 +7342,7 @@ impl GitPanel {
         !matches!(
             rows,
             [] | [RepositoryTreeRow {
-                source: RepositoryTreeSource::Loaded(_),
+                entry: RepositoryTreeEntry::Repository(RepositoryTreeSource::Loaded(_)),
                 ..
             }]
         )
@@ -7331,7 +7362,7 @@ impl GitPanel {
             .work_directory_abs_path
             .clone();
         rows.into_iter()
-            .find(|row| row.work_directory == active_work_directory)
+            .find(|row| row.path == active_work_directory)
     }
 
     fn render_changes_root(&self, root: RepositoryTreeRow, cx: &App) -> AnyElement {
@@ -7352,8 +7383,8 @@ impl GitPanel {
                     .color(Color::Muted),
             )
             .child(Label::new(root.name).size(LabelSize::Small).truncate())
-            .children(root.relative_path.map(|relative_path| {
-                Label::new(relative_path)
+            .children(root.location.map(|location| {
+                Label::new(location)
                     .size(LabelSize::Small)
                     .color(Color::Muted)
                     .truncate()
@@ -7378,7 +7409,11 @@ impl GitPanel {
             .active_repository
             .as_ref()
             .map(|repository| repository.read(cx).work_directory_abs_path.clone());
-        let row_count = rows.len();
+        let repository_count = rows
+            .iter()
+            .filter(|row| matches!(row.entry, RepositoryTreeEntry::Repository(_)))
+            .count();
+        let rows = visible_repository_tree_rows(rows, &self.collapsed_repository_tree_paths);
 
         let header = h_flex()
             .flex_none()
@@ -7391,7 +7426,7 @@ impl GitPanel {
             )
             .child(Label::new("Repositories").size(LabelSize::Small))
             .child(
-                Label::new(row_count.to_string())
+                Label::new(repository_count.to_string())
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             );
@@ -7402,7 +7437,7 @@ impl GitPanel {
                 .min_h_0()
                 .overflow_y_scroll()
                 .children(rows.into_iter().enumerate().map(|(index, row)| {
-                    let is_active = active_work_directory.as_ref() == Some(&row.work_directory);
+                    let is_active = active_work_directory.as_ref() == Some(&row.path);
                     self.render_repository_tree_row(index, row, is_active, cx)
                 }))
         });
@@ -7428,8 +7463,8 @@ impl GitPanel {
         is_active: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let repository = match row.source {
-            RepositoryTreeSource::Loaded(id) => self
+        let repository = match row.entry {
+            RepositoryTreeEntry::Repository(RepositoryTreeSource::Loaded(id)) => self
                 .project
                 .read(cx)
                 .git_store()
@@ -7437,9 +7472,12 @@ impl GitPanel {
                 .repositories()
                 .get(&id)
                 .cloned(),
-            RepositoryTreeSource::Parked => None,
+            RepositoryTreeEntry::Repository(RepositoryTreeSource::Parked)
+            | RepositoryTreeEntry::Folder => None,
         };
-        let is_parked = repository.is_none();
+        let is_folder = row.entry == RepositoryTreeEntry::Folder;
+        let is_parked = !is_folder && repository.is_none();
+        let is_expanded = !self.collapsed_repository_tree_paths.contains(&row.path);
         let (branch_label, tracking_status, changed_count) = repository
             .map(|repository| {
                 let repository = repository.read(cx);
@@ -7454,24 +7492,51 @@ impl GitPanel {
                 (branch_label, tracking_status, changed_count)
             })
             .unwrap_or_default();
-        let name_color = if is_parked {
+        let name_color = if is_parked || is_folder {
             Color::Muted
         } else {
             Color::Default
         };
+        let disclosure =
+            h_flex()
+                .flex_none()
+                .w_4()
+                .justify_center()
+                .when(row.has_children, |this| {
+                    let path = row.path.clone();
+                    this.child(
+                        Disclosure::new(("repository-tree-disclosure", index), is_expanded)
+                            .shape(ui::IconButtonShape::Square)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_repository_tree_row(&path, cx);
+                            })),
+                    )
+                });
+        let folder_icon = is_folder.then(|| {
+            Icon::new(if is_expanded {
+                IconName::FolderOpen
+            } else {
+                IconName::Folder
+            })
+            .size(IconSize::Small)
+            .color(Color::Muted)
+        });
 
         h_flex()
             .id(("repository-tree-row", index))
             .w_full()
             .py_0p5()
             .pr_2()
-            .pl(px(8. + 12. * row.depth as f32))
+            .pl(px(4. + 12. * row.depth as f32))
             .gap_1()
             .cursor_pointer()
             .when(is_active, |this| {
                 this.bg(cx.theme().colors().element_selected)
             })
             .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .child(disclosure)
+            .children(folder_icon)
             .child(
                 Label::new(row.name.clone())
                     .size(LabelSize::Small)
@@ -14250,6 +14315,7 @@ mod tests {
                 commit_messages: panel.serialized_commit_messages(cx),
                 commit_editor_collapsed: None,
                 repository_tree_collapsed: false,
+                collapsed_repository_tree_paths: Vec::new(),
             }
         });
 
@@ -14295,6 +14361,7 @@ mod tests {
             signoff_enabled: false,
             commit_editor_collapsed: None,
             repository_tree_collapsed: false,
+            collapsed_repository_tree_paths: Vec::new(),
             commit_messages: BTreeMap::from_iter([(
                 path!("/root/other-project").to_string(),
                 SerializedCommitMessage {
@@ -14395,6 +14462,7 @@ mod tests {
             commit_messages: panel.serialized_commit_messages(cx),
             commit_editor_collapsed: None,
             repository_tree_collapsed: false,
+            collapsed_repository_tree_paths: Vec::new(),
         });
         let buffer = repository.read_with(cx, |repository, _| {
             repository.commit_message_buffer().unwrap().clone()
@@ -14492,6 +14560,7 @@ mod tests {
             commit_messages: panel.serialized_commit_messages(cx),
             commit_editor_collapsed: None,
             repository_tree_collapsed: false,
+            collapsed_repository_tree_paths: Vec::new(),
         });
 
         // Simulate a restart and restore from the serialized state.
@@ -19255,9 +19324,18 @@ mod tests {
         let rows = panel.read_with(cx, |panel, cx| panel.repository_tree_rows(cx));
         let names = rows.iter().map(|row| row.name.as_ref()).collect::<Vec<_>>();
         assert_eq!(names, ["three", "one", "two"]);
-        assert_eq!(rows[0].source, RepositoryTreeSource::Parked);
-        assert!(matches!(rows[1].source, RepositoryTreeSource::Loaded(_)));
-        assert!(matches!(rows[2].source, RepositoryTreeSource::Loaded(_)));
+        assert_eq!(
+            rows[0].entry,
+            RepositoryTreeEntry::Repository(RepositoryTreeSource::Parked)
+        );
+        assert!(matches!(
+            rows[1].entry,
+            RepositoryTreeEntry::Repository(RepositoryTreeSource::Loaded(_))
+        ));
+        assert!(matches!(
+            rows[2].entry,
+            RepositoryTreeEntry::Repository(RepositoryTreeSource::Loaded(_))
+        ));
 
         cx.draw(
             point(px(0.), px(0.)),
@@ -19301,7 +19379,10 @@ mod tests {
             PathBuf::from(path!("/project/nested/deep/three"))
         );
         let three = repository_tree_row(&panel, "three", cx);
-        assert!(matches!(three.source, RepositoryTreeSource::Loaded(_)));
+        assert!(matches!(
+            three.entry,
+            RepositoryTreeEntry::Repository(RepositoryTreeSource::Loaded(_))
+        ));
     }
 
     #[gpui::test]
@@ -19451,7 +19532,10 @@ mod tests {
 
         let rows = panel.read_with(cx, |panel, cx| panel.repository_tree_rows(cx));
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].source, RepositoryTreeSource::Parked);
+        assert_eq!(
+            rows[0].entry,
+            RepositoryTreeEntry::Repository(RepositoryTreeSource::Parked)
+        );
 
         cx.draw(
             point(px(0.), px(0.)),
@@ -19477,7 +19561,10 @@ mod tests {
         let panel = workspace.update_in(cx, GitPanel::new);
         cx.run_until_parked();
 
-        panel.update(cx, |panel, cx| panel.toggle_repository_tree(cx));
+        panel.update(cx, |panel, cx| {
+            panel.toggle_repository_tree(cx);
+            panel.toggle_repository_tree_row(&Arc::from(Path::new(path!("/project/one"))), cx);
+        });
         let serialized = panel.read_with(cx, |panel, cx| {
             serde_json::to_string(&panel.serialized_panel(cx)).unwrap()
         });
@@ -19488,5 +19575,10 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(restored_panel.read_with(cx, |panel, _| panel.repository_tree_collapsed));
+        assert!(restored_panel.read_with(cx, |panel, _| {
+            panel
+                .collapsed_repository_tree_paths
+                .contains(Path::new(path!("/project/one")))
+        }));
     }
 }
