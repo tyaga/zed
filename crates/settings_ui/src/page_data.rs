@@ -6587,7 +6587,7 @@ fn panels_page() -> SettingsPage {
             SettingsPageItem::SectionHeader("Git Panel"),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Date Style",
-                description: "Show relative or absolute dates in commit history.",
+                description: "Show relative, absolute or compact dates in commit history.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("git_panel.date_style"),
@@ -8557,7 +8557,7 @@ fn version_control_page() -> SettingsPage {
             SettingsPageItem::SectionHeader("Inline Git Blame"),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Date Style",
-                description: "Show relative or absolute dates inline and in the status bar.",
+                description: "Show relative, absolute or compact dates inline and in the status bar.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("git.inline_blame.date_style"),
@@ -8768,7 +8768,7 @@ fn version_control_page() -> SettingsPage {
             SettingsPageItem::SectionHeader("Git Blame View"),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Date Style",
-                description: "Show relative or absolute dates in the blame gutter.",
+                description: "Show relative, absolute or compact dates in the blame gutter.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("git.blame.date_style"),
@@ -8820,7 +8820,7 @@ fn version_control_page() -> SettingsPage {
             SettingsPageItem::SectionHeader("Branch Picker"),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Date Style",
-                description: "Show relative or absolute dates in the branch picker.",
+                description: "Show relative, absolute or compact dates in the branch picker.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("git.branch_picker.date_style"),
@@ -8880,7 +8880,7 @@ fn version_control_page() -> SettingsPage {
             SettingsPageItem::SectionHeader("Stash Picker"),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Date Style",
-                description: "Show relative or absolute dates in the stash picker.",
+                description: "Show relative, absolute or compact dates in the stash picker.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("git.stash_picker.date_style"),
@@ -8913,7 +8913,7 @@ fn version_control_page() -> SettingsPage {
             SettingsPageItem::SectionHeader("Git Graph"),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Date Style",
-                description: "Show relative or absolute dates in graph rows.",
+                description: "Show relative, absolute or compact dates in graph rows.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("git_graph.date_style"),

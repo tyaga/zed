@@ -3202,7 +3202,8 @@ view's **Date Style**. The Git Panel's date style is under **Panels**.
 Dates use your local time zone. Empty or invalid formats fall back to `"locale"`.
 Hovers, tooltips, and commit views always show absolute dates using this format.
 
-Each view has its own `date_style`, either `"relative"` or `"absolute"`. The default
+Each view has its own `date_style`: `"relative"`, `"absolute"`, or `"compact"`
+("Today 14:05", "Yesterday 09:30", "18-09 14:05", "18-09-2024 14:05"). The default
 is `"relative"` for blame, inline blame (including the status bar), branch and stash
 pickers, and Git Panel history. Git Graph rows default to `"absolute"`.
 

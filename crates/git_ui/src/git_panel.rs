@@ -8269,9 +8269,14 @@ impl GitPanel {
             cx,
         );
         self._user_email_task = cx.spawn(async move |this, cx| {
-            // `git config --get` fails when the email is not configured; nothing is highlighted then.
-            let Ok(user_email) = user_email.await else {
-                return;
+            // Fails when the email is not configured, and in remote and collab projects, where
+            // git config is not available; no commits are highlighted then.
+            let user_email = match user_email.await {
+                Ok(user_email) => user_email,
+                Err(error) => {
+                    log::debug!("reading user.email for commit highlighting: {error:#}");
+                    return;
+                }
             };
             let user_email = user_email.trim().to_string();
             this.update(cx, |this, cx| {
@@ -10573,7 +10578,11 @@ impl Render for GitPanel {
                                                 )),
                                         )
                                     } else {
-                                        this.child(self.render_empty_state(cx).into_any_element())
+                                        this.children(
+                                            self.changes_root(cx)
+                                                .map(|root| self.render_changes_root(root, cx)),
+                                        )
+                                        .child(self.render_empty_state(cx).into_any_element())
                                     }
                                 })
                             })

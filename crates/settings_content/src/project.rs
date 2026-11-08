@@ -790,7 +790,7 @@ pub enum InlineBlameLocation {
 #[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
 #[serde(rename_all = "snake_case")]
 pub struct InlineBlameSettings {
-    /// Whether to show relative or absolute dates.
+    /// Whether to show relative, absolute or compact dates.
     ///
     /// Default: relative
     pub date_style: Option<GitDateStyle>,
@@ -827,7 +827,7 @@ pub struct InlineBlameSettings {
 #[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
 #[serde(rename_all = "snake_case")]
 pub struct BlameSettings {
-    /// Whether to show relative or absolute dates in the blame gutter.
+    /// Whether to show relative, absolute or compact dates in the blame gutter.
     ///
     /// Default: relative
     pub date_style: Option<GitDateStyle>,
@@ -841,7 +841,7 @@ pub struct BlameSettings {
 #[derive(Clone, Copy, PartialEq, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
 #[serde(rename_all = "snake_case")]
 pub struct BranchPickerSettingsContent {
-    /// Whether to show relative or absolute dates.
+    /// Whether to show relative, absolute or compact dates.
     ///
     /// Default: relative
     pub date_style: Option<GitDateStyle>,
@@ -877,7 +877,7 @@ pub enum GitDateStyle {
 #[with_fallible_options]
 #[derive(Clone, Copy, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct StashPickerSettings {
-    /// Whether to show relative or absolute dates.
+    /// Whether to show relative, absolute or compact dates.
     ///
     /// Default: relative
     pub date_style: Option<GitDateStyle>,
