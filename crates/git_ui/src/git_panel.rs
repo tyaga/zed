@@ -1695,6 +1695,13 @@ impl GitPanel {
                     ) => {
                         this.default_branch_may_have_changed(window, cx);
                     }
+                    GitStoreEvent::RepositoryUpdated(
+                        _,
+                        RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
+                        false,
+                    ) => {
+                        cx.notify();
+                    }
                     GitStoreEvent::RepositoryUpdated(_, _, _) => {}
                     GitStoreEvent::JobsUpdated
                     | GitStoreEvent::ConflictsUpdated
@@ -18889,6 +18896,41 @@ mod tests {
         );
         let three = repository_tree_row(&panel, "three", cx);
         assert!(matches!(three.source, RepositoryTreeSource::Loaded(_)));
+    }
+
+    #[gpui::test]
+    async fn test_repository_tree_refreshes_for_inactive_repository(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(path!("/project"), repository_tree_fixture())
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+        cx.run_until_parked();
+
+        let one = repository_tree_row(&panel, "one", cx);
+        panel.update(cx, |panel, cx| panel.activate_repository_tree_row(&one, cx));
+        cx.run_until_parked();
+
+        let notify_count = Rc::new(Cell::new(0));
+        let _subscription = cx.update(|_, cx| {
+            let notify_count = notify_count.clone();
+            cx.observe(&panel, move |_, _| notify_count.set(notify_count.get() + 1))
+        });
+
+        fs.set_status_for_repo(
+            Path::new(path!("/project/two/.git")),
+            &[("b.txt", StatusCode::Modified.worktree())],
+        );
+        cx.run_until_parked();
+
+        assert!(notify_count.get() > 0);
     }
 
     #[gpui::test]
