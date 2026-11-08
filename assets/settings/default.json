@@ -1162,6 +1162,10 @@
     //
     // Default: 0
     "commit_title_max_length": 0,
+    // Whether to show the button that generates a commit message in the commit editor.
+    //
+    // Default: true
+    "generate_commit_message_button": true,
     // Default action when clicking a changed file in the Git panel.
     //
     // Choices: project_diff, file_diff, view_file

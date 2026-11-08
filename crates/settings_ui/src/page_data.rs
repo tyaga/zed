@@ -6568,7 +6568,7 @@ fn panels_page() -> SettingsPage {
         ]
     }
 
-    fn git_panel_section() -> [SettingsPageItem; 20] {
+    fn git_panel_section() -> [SettingsPageItem; 21] {
         [
             SettingsPageItem::SectionHeader("Git Panel"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -6881,6 +6881,29 @@ fn panels_page() -> SettingsPage {
                             .git_panel
                             .get_or_insert_default()
                             .show_count_badge = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Generate Commit Message Button",
+                description: "Whether to show the button that generates a commit message in the commit editor.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("git_panel.generate_commit_message_button"),
+                    pick: |settings_content| {
+                        settings_content
+                            .git_panel
+                            .as_ref()?
+                            .generate_commit_message_button
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .git_panel
+                            .get_or_insert_default()
+                            .generate_commit_message_button = value;
                     },
                 }),
                 metadata: None,

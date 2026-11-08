@@ -823,6 +823,11 @@ pub struct GitPanelSettingsContent {
     /// Default: 0
     pub commit_title_max_length: Option<usize>,
 
+    /// Whether to show the button that generates a commit message in the commit editor.
+    ///
+    /// Default: true
+    pub generate_commit_message_button: Option<bool>,
+
     /// Default action when clicking a changed file in the Git panel.
     ///
     /// Default: project_diff

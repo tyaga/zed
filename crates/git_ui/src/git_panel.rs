@@ -6878,7 +6878,9 @@ impl GitPanel {
         &self,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        if !agent_settings::AgentSettings::get_global(cx).enabled(cx) {
+        if !agent_settings::AgentSettings::get_global(cx).enabled(cx)
+            || !GitPanelSettings::get_global(cx).generate_commit_message_button
+        {
             return None;
         }
 
@@ -11051,6 +11053,42 @@ mod tests {
             panel.toggle_skip_hooks(&SkipHooks, window, cx);
             assert!(!panel.skip_hooks_enabled());
             assert!(!panel.commit_options().no_verify);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_generate_commit_message_button_setting(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_, _, _, panel, mut cx) = setup_git_panel_with_changes(
+            cx,
+            json!({
+                ".git": {},
+                "file": "modified\n",
+            }),
+            &[("file", StatusCode::Modified)],
+        )
+        .await;
+        let set_button_visible = |visible: bool, cx: &mut VisualTestContext| {
+            cx.update(|_window, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings
+                            .git_panel
+                            .get_or_insert_default()
+                            .generate_commit_message_button = Some(visible);
+                    });
+                });
+            });
+        };
+
+        set_button_visible(true, &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            assert!(panel.render_generate_commit_message_button(cx).is_some());
+        });
+
+        set_button_visible(false, &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            assert!(panel.render_generate_commit_message_button(cx).is_none());
         });
     }
 
