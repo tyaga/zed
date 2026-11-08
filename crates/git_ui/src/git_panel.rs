@@ -141,6 +141,24 @@ impl HistoryColumns {
     }
 }
 
+/// The current branch name, or the short HEAD sha when detached.
+fn repository_branch_label(repository: &Repository) -> Option<SharedString> {
+    repository
+        .branch
+        .as_ref()
+        .map(|branch| SharedString::from(branch.name().to_owned()))
+        .or_else(|| {
+            repository.head_commit.as_ref().map(|commit| {
+                commit
+                    .sha
+                    .chars()
+                    .take(MAX_SHORT_SHA_LEN)
+                    .collect::<String>()
+                    .into()
+            })
+        })
+}
+
 fn is_own_commit(author_email: &str, user_email: &str) -> bool {
     !author_email.is_empty() && author_email.eq_ignore_ascii_case(user_email)
 }
@@ -7287,13 +7305,72 @@ impl GitPanel {
         cx.notify();
     }
 
+    /// The tree is hidden when its only row is a loaded repository; a sole parked repository
+    /// is listed so it can be activated.
+    fn should_show_repository_tree(rows: &[RepositoryTreeRow]) -> bool {
+        !matches!(
+            rows,
+            [] | [RepositoryTreeRow {
+                source: RepositoryTreeSource::Loaded(_),
+                ..
+            }]
+        )
+    }
+
+    /// The active repository's tree row, shown above the Changes list when the project has
+    /// several repositories.
+    fn changes_root(&self, cx: &App) -> Option<RepositoryTreeRow> {
+        let rows = self.repository_tree_rows(cx);
+        if !Self::should_show_repository_tree(&rows) {
+            return None;
+        }
+        let active_work_directory = self
+            .active_repository
+            .as_ref()?
+            .read(cx)
+            .work_directory_abs_path
+            .clone();
+        rows.into_iter()
+            .find(|row| row.work_directory == active_work_directory)
+    }
+
+    fn render_changes_root(&self, root: RepositoryTreeRow, cx: &App) -> AnyElement {
+        let branch_label = self
+            .active_repository
+            .as_ref()
+            .and_then(|repository| repository_branch_label(repository.read(cx)));
+        h_flex()
+            .debug_selector(|| "changes-repository-root".into())
+            .flex_none()
+            .w_full()
+            .h(self.list_item_height())
+            .px_2()
+            .gap_1()
+            .child(
+                Icon::new(IconName::FolderOpen)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(Label::new(root.name).size(LabelSize::Small).truncate())
+            .children(root.relative_path.map(|relative_path| {
+                Label::new(relative_path)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate()
+            }))
+            .child(div().flex_1())
+            .children(branch_label.map(|branch_label| {
+                Label::new(branch_label)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate()
+            }))
+            .into_any_element()
+    }
+
     fn render_repository_tree(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let rows = self.repository_tree_rows(cx);
-        let only_loaded_repository = matches!(
-            rows.as_slice(),
-            [row] if matches!(row.source, RepositoryTreeSource::Loaded(_))
-        );
-        if rows.is_empty() || only_loaded_repository {
+        if !Self::should_show_repository_tree(&rows) {
             return None;
         }
         let collapsed = self.repository_tree_collapsed;
@@ -7366,20 +7443,7 @@ impl GitPanel {
         let (branch_label, tracking_status, changed_count) = repository
             .map(|repository| {
                 let repository = repository.read(cx);
-                let branch_label = repository
-                    .branch
-                    .as_ref()
-                    .map(|branch| SharedString::from(branch.name().to_owned()))
-                    .or_else(|| {
-                        repository.head_commit.as_ref().map(|commit| {
-                            commit
-                                .sha
-                                .chars()
-                                .take(MAX_SHORT_SHA_LEN)
-                                .collect::<String>()
-                                .into()
-                        })
-                    });
+                let branch_label = repository_branch_label(repository);
                 let tracking_status = repository
                     .branch
                     .as_ref()
@@ -10490,12 +10554,24 @@ impl Render for GitPanel {
                                     if let Some(repo) = self.active_repository.clone()
                                         && has_entries
                                     {
-                                        this.child(self.render_entries(
-                                            has_write_access,
-                                            repo,
-                                            window,
-                                            cx,
-                                        ))
+                                        let root = self.changes_root(cx);
+                                        let has_root = root.is_some();
+                                        this.children(
+                                            root.map(|root| self.render_changes_root(root, cx)),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .size_full()
+                                                .overflow_hidden()
+                                                .when(has_root, |this| this.pl(px(TREE_INDENT)))
+                                                .child(self.render_entries(
+                                                    has_write_access,
+                                                    repo,
+                                                    window,
+                                                    cx,
+                                                )),
+                                        )
                                     } else {
                                         this.child(self.render_empty_state(cx).into_any_element())
                                     }
@@ -19279,6 +19355,70 @@ mod tests {
             |_, _| panel.clone().into_any_element(),
         );
         assert!(cx.debug_bounds("repository-tree").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_changes_root_shows_active_repository_with_several_repositories(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                "one": { ".git": {}, "a.txt": "" },
+                "two": { ".git": {}, "b.txt": "" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+        cx.run_until_parked();
+
+        let root = panel.read_with(cx, |panel, cx| panel.changes_root(cx));
+        assert!(root.is_some());
+        let active_name = panel.read_with(cx, |panel, cx| {
+            panel.active_repository.as_ref().map(|repository| {
+                repository
+                    .read(cx)
+                    .work_directory_abs_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+        });
+        assert_eq!(root.map(|row| row.name.to_string()), active_name.flatten());
+    }
+
+    #[gpui::test]
+    async fn test_changes_root_hidden_for_single_repository(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ "one": { ".git": {}, "a.txt": "" } }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+        cx.run_until_parked();
+
+        assert!(
+            panel
+                .read_with(cx, |panel, cx| panel.changes_root(cx))
+                .is_none()
+        );
     }
 
     #[gpui::test]
