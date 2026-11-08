@@ -17,6 +17,7 @@ pub use crate::extension::init_proxy as init_extension_proxy;
 use crate::provider::anthropic::AnthropicLanguageModelProvider;
 use crate::provider::anthropic_compatible::AnthropicCompatibleLanguageModelProvider;
 use crate::provider::bedrock::BedrockLanguageModelProvider;
+use crate::provider::claude_code::ClaudeCodeProvider;
 use crate::provider::cloud::CloudLanguageModelProvider;
 use crate::provider::copilot_chat::CopilotChatLanguageModelProvider;
 use crate::provider::google::GoogleLanguageModelProvider;
@@ -361,6 +362,7 @@ fn register_language_model_providers(
         )),
         cx,
     );
+    registry.register_provider(Arc::new(ClaudeCodeProvider::new(cx)), cx);
 }
 
 #[cfg(test)]

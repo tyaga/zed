@@ -1,10 +1,30 @@
-use std::path::PathBuf;
+use std::collections::VecDeque;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
+use anyhow::{Context as _, anyhow};
+use futures::future::BoxFuture;
+use futures::io::BufReader;
+use futures::stream::BoxStream;
+use futures::{AsyncBufReadExt as _, AsyncWriteExt as _, FutureExt as _, StreamExt as _};
+use gpui::{
+    AnyView, App, AppContext as _, AsyncApp, BackgroundExecutor, Render, Task, Window, div,
+};
 use language_model::{
-    LanguageModelCompletionEvent, LanguageModelProviderId, LanguageModelProviderName,
-    LanguageModelRequest, MessageContent, Role, TokenUsage,
+    AuthenticateError, InlineDescription, InlineProviderSettings, LanguageModel,
+    LanguageModelClient, LanguageModelCompletionError, LanguageModelCompletionEvent,
+    LanguageModelCompletionStream, LanguageModelId, LanguageModelName, LanguageModelProvider,
+    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
+    LanguageModelRequest, MessageContent, ProviderErrorCategory, ProviderSettingsView, Role,
+    StopReason, TokenUsage,
 };
 use serde_json::Value;
+use settings::Settings as _;
+use util::command::{Child, Stdio};
+
+use crate::AllLanguageModelSettings;
 
 pub const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("claude-code");
 pub const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new("Claude Code");
@@ -193,12 +213,313 @@ pub(crate) fn parse_claude_code_line(line: &str) -> ClaudeCodeLine {
     }
 }
 
+const MAX_TOKEN_COUNT: u64 = 200_000;
+const STDERR_TAIL_LINES: usize = 20;
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const SIGN_IN_MESSAGE: &str =
+    "Claude Code is not signed in. Run `claude` in a terminal and sign in.";
+
+/// An explicitly configured path is never substituted with a discovered one,
+/// so a wrong setting surfaces as a missing binary instead of silently
+/// running a different `claude`.
+fn resolve_claude_binary(
+    configured: Option<&Path>,
+    path_env: Option<&OsStr>,
+    home: &Path,
+) -> Option<PathBuf> {
+    if let Some(configured) = configured {
+        return configured.is_file().then(|| configured.to_path_buf());
+    }
+    path_env
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|directory| directory.join("claude"))
+        .chain([
+            home.join(".local/bin/claude"),
+            home.join(".claude/local/claude"),
+        ])
+        .find(|candidate| candidate.is_file())
+}
+
+fn claude_binary(cx: &App) -> Option<PathBuf> {
+    resolve_claude_binary(
+        AllLanguageModelSettings::get_global(cx)
+            .claude_code
+            .path
+            .as_deref(),
+        std::env::var_os("PATH").as_deref(),
+        paths::home_dir(),
+    )
+}
+
+fn model_display_name(id: &str) -> String {
+    match id {
+        "sonnet" => "Claude Sonnet".to_string(),
+        "opus" => "Claude Opus".to_string(),
+        "haiku" => "Claude Haiku".to_string(),
+        "fable" => "Claude Fable".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn claude_code_model(id: &'static str) -> LanguageModel {
+    LanguageModel {
+        supports_tools: false,
+        supports_images: false,
+        ..LanguageModel::new(
+            LanguageModelId(id.into()),
+            LanguageModelName(model_display_name(id).into()),
+            PROVIDER_ID,
+            PROVIDER_NAME,
+            format!("claude-code/{id}"),
+            MAX_TOKEN_COUNT,
+        )
+    }
+}
+
+pub struct ClaudeCodeProvider;
+
+impl ClaudeCodeProvider {
+    pub fn new(_cx: &mut App) -> Self {
+        Self
+    }
+}
+
+impl LanguageModelProviderState for ClaudeCodeProvider {
+    type ObservableEntity = ();
+
+    fn observable_entity(&self) -> Option<gpui::Entity<Self::ObservableEntity>> {
+        None
+    }
+}
+
+impl LanguageModelProvider for ClaudeCodeProvider {
+    fn id(&self) -> LanguageModelProviderId {
+        PROVIDER_ID
+    }
+
+    fn name(&self) -> LanguageModelProviderName {
+        PROVIDER_NAME
+    }
+
+    fn default_model(&self, _cx: &App) -> Option<LanguageModel> {
+        Some(claude_code_model(MODEL_IDS[0]))
+    }
+
+    fn default_fast_model(&self, _cx: &App) -> Option<LanguageModel> {
+        Some(claude_code_model(MODEL_IDS[0]))
+    }
+
+    fn provided_models(&self, _cx: &App) -> Vec<LanguageModel> {
+        MODEL_IDS.into_iter().map(claude_code_model).collect()
+    }
+
+    fn is_authenticated(&self, cx: &App) -> bool {
+        claude_binary(cx).is_some()
+    }
+
+    fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
+        Task::ready(if claude_binary(cx).is_some() {
+            Ok(())
+        } else {
+            Err(AuthenticateError::CredentialsNotFound)
+        })
+    }
+
+    fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView> {
+        let description = match claude_binary(cx) {
+            Some(binary) => format!("Uses {}", binary.display()),
+            None => {
+                "`claude` not found — install Claude Code or set language_models.claude_code.path"
+                    .to_string()
+            }
+        };
+        Some(ProviderSettingsView::Inline(InlineProviderSettings {
+            title: Some(PROVIDER_NAME.0),
+            description: Some(InlineDescription::Text(description.into())),
+            create_view: Arc::new(|_window: &mut Window, cx: &mut App| -> AnyView {
+                cx.new(|_| ConfigurationView).into()
+            }),
+        }))
+    }
+}
+
+struct ConfigurationView;
+
+impl Render for ConfigurationView {
+    fn render(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        div()
+    }
+}
+
+impl LanguageModelClient for ClaudeCodeProvider {
+    fn stream_completion(
+        &self,
+        model: &LanguageModel,
+        request: LanguageModelRequest,
+        cx: &AsyncApp,
+    ) -> BoxFuture<'static, Result<LanguageModelCompletionStream, LanguageModelCompletionError>>
+    {
+        let Some(binary) = cx.update(|cx| claude_binary(cx)) else {
+            return futures::future::ready(Err(LanguageModelCompletionError::NoApiKey {
+                provider: PROVIDER_NAME,
+            }))
+            .boxed();
+        };
+        let prompt = claude_code_prompt(&request);
+        let arguments = claude_code_arguments(&model.id.0, prompt.system_prompt.as_deref());
+        let executor = cx.background_executor().clone();
+        async move {
+            let process =
+                ClaudeCodeProcess::spawn(&binary, &arguments, &prompt.prompt, executor).await?;
+            Ok(process.into_events())
+        }
+        .boxed()
+    }
+}
+
+/// Owns everything a running completion depends on, so dropping the
+/// completion stream kills the CLI and removes its working directory.
+struct ClaudeCodeProcess {
+    lines: BoxStream<'static, std::io::Result<String>>,
+    stderr_tail: Task<VecDeque<String>>,
+    executor: BackgroundExecutor,
+    _child: Child,
+    _working_directory: tempfile::TempDir,
+}
+
+impl ClaudeCodeProcess {
+    async fn spawn(
+        binary: &Path,
+        arguments: &[String],
+        prompt: &str,
+        executor: BackgroundExecutor,
+    ) -> anyhow::Result<Self> {
+        // An empty working directory keeps the CLI from picking up project
+        // files or instructions from wherever Zed was launched.
+        let working_directory =
+            tempfile::tempdir().context("failed to create a working directory for Claude Code")?;
+        let mut child = util::command::new_command(binary)
+            .args(arguments)
+            .current_dir(working_directory.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("failed to start {}", binary.display()))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("Claude Code stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Claude Code stdout unavailable")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Claude Code stderr unavailable")?;
+
+        // Stderr is drained concurrently so a chatty CLI cannot block on a full
+        // pipe while stdout is being read.
+        let stderr_tail = executor.spawn(async move {
+            let mut tail = VecDeque::with_capacity(STDERR_TAIL_LINES);
+            let mut lines = BufReader::new(stderr).lines();
+            while let Some(Ok(line)) = lines.next().await {
+                if tail.len() == STDERR_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+            tail
+        });
+
+        stdin
+            .write_all(prompt.as_bytes())
+            .await
+            .context("failed to send the prompt to Claude Code")?;
+        drop(stdin);
+
+        Ok(Self {
+            lines: BufReader::new(stdout).lines().boxed(),
+            stderr_tail,
+            executor,
+            _child: child,
+            _working_directory: working_directory,
+        })
+    }
+
+    async fn stderr_tail(self) -> Vec<String> {
+        let timeout = self.executor.timer(STDERR_DRAIN_TIMEOUT);
+        futures::select_biased! {
+            tail = self.stderr_tail.fuse() => tail.into(),
+            _ = timeout.fuse() => Vec::new(),
+        }
+    }
+
+    fn into_events(self) -> LanguageModelCompletionStream {
+        futures::stream::unfold(Some(self), |process| async move {
+            let mut process = process?;
+            loop {
+                let event = match process.lines.next().await {
+                    Some(Ok(line)) => match parse_claude_code_line(&line) {
+                        ClaudeCodeLine::Event(event) => return Some((Ok(event), Some(process))),
+                        ClaudeCodeLine::Ignored => continue,
+                        ClaudeCodeLine::Finished => {
+                            Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn))
+                        }
+                        ClaudeCodeLine::Failed(ClaudeCodeFailure::SignInRequired(message)) => {
+                            log::warn!("Claude Code sign-in required: {message}");
+                            Err(LanguageModelCompletionError::ProviderRejection {
+                                provider: PROVIDER_NAME,
+                                status: None,
+                                code: None,
+                                message: SIGN_IN_MESSAGE.to_string(),
+                                retry_after: None,
+                                category: ProviderErrorCategory::Authentication,
+                            })
+                        }
+                        ClaudeCodeLine::Failed(ClaudeCodeFailure::Error(message)) => {
+                            Err(LanguageModelCompletionError::Other(anyhow!(message)))
+                        }
+                    },
+                    Some(Err(error)) => Err(LanguageModelCompletionError::Other(
+                        anyhow::Error::new(error).context("failed to read Claude Code output"),
+                    )),
+                    None => {
+                        let tail = process.stderr_tail().await;
+                        log::warn!(
+                            "Claude Code exited without a result. Last stderr lines:\n{}",
+                            tail.join("\n")
+                        );
+                        return Some((
+                            Err(LanguageModelCompletionError::StreamEndedUnexpectedly {
+                                provider: PROVIDER_NAME,
+                            }),
+                            None,
+                        ));
+                    }
+                };
+                return Some((event, None));
+            }
+        })
+        .boxed()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{BorrowAppContext as _, TestAppContext};
     use language_model::{
         LanguageModelImage, LanguageModelRequestMessage, LanguageModelRequestMessage as Message,
     };
+    use settings::SettingsStore;
 
     fn message(role: Role, text: &str) -> Message {
         Message {
@@ -371,6 +692,187 @@ mod tests {
         assert!(matches!(
             parse_claude_code_line(line),
             ClaudeCodeLine::Failed(ClaudeCodeFailure::Error(message)) if message == "Overloaded"
+        ));
+    }
+
+    fn create_file(path: &Path) -> PathBuf {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, "").unwrap();
+        path.to_path_buf()
+    }
+
+    #[test]
+    fn test_resolve_binary_prefers_configured_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let configured = create_file(&directory.path().join("custom/claude"));
+        let on_path = directory.path().join("bin");
+        create_file(&on_path.join("claude"));
+        let path_env = std::env::join_paths([&on_path]).unwrap();
+
+        assert_eq!(
+            resolve_claude_binary(Some(&configured), Some(&path_env), directory.path()),
+            Some(configured)
+        );
+        assert_eq!(
+            resolve_claude_binary(
+                Some(&directory.path().join("missing/claude")),
+                Some(&path_env),
+                directory.path()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_binary_from_path_env() {
+        let directory = tempfile::tempdir().unwrap();
+        let empty = directory.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let bin = directory.path().join("bin");
+        let expected = create_file(&bin.join("claude"));
+        create_file(&directory.path().join(".local/bin/claude"));
+        let path_env = std::env::join_paths([&empty, &bin]).unwrap();
+
+        assert_eq!(
+            resolve_claude_binary(None, Some(&path_env), directory.path()),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn test_resolve_binary_falls_back_to_local_bin() {
+        let home = tempfile::tempdir().unwrap();
+        let path_env = std::env::join_paths([home.path().join("empty")]).unwrap();
+        let fallback = create_file(&home.path().join(".claude/local/claude"));
+
+        assert_eq!(
+            resolve_claude_binary(None, Some(&path_env), home.path()),
+            Some(fallback)
+        );
+
+        let local_bin = create_file(&home.path().join(".local/bin/claude"));
+        assert_eq!(
+            resolve_claude_binary(None, None, home.path()),
+            Some(local_bin)
+        );
+        assert_eq!(
+            resolve_claude_binary(None, None, &home.path().join("elsewhere")),
+            None
+        );
+    }
+
+    fn init_provider(path: &Path, cx: &mut TestAppContext) -> ClaudeCodeProvider {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .language_models
+                        .get_or_insert_default()
+                        .claude_code
+                        .get_or_insert_default()
+                        .path = Some(path.to_string_lossy().into_owned());
+                });
+            });
+            ClaudeCodeProvider::new(cx)
+        })
+    }
+
+    #[cfg(unix)]
+    fn fake_cli(directory: &Path, lines: &[&str]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut script = String::from("#!/bin/sh\ncat > /dev/null\n");
+        for line in lines {
+            script.push_str(&format!("printf '%s\\n' '{line}'\n"));
+        }
+        let path = directory.join("claude");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    async fn stream_events(
+        provider: &ClaudeCodeProvider,
+        cx: &mut TestAppContext,
+    ) -> Result<
+        Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>,
+        LanguageModelCompletionError,
+    > {
+        let model = cx.update(|cx| provider.default_model(cx)).unwrap();
+        let future = provider.stream_completion(
+            &model,
+            request(vec![message(Role::User, "hello")]),
+            &cx.to_async(),
+        );
+        Ok(future.await?.collect().await)
+    }
+
+    const MESSAGE_START_LINE: &str =
+        r#"{"type":"stream_event","event":{"type":"message_start","message":{"content":[]}}}"#;
+    const HELLO_LINE: &str = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}}"#;
+    const RESULT_LINE: &str =
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"Hello"}"#;
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_streams_events_from_cli(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let binary = fake_cli(
+            directory.path(),
+            &[MESSAGE_START_LINE, HELLO_LINE, RESULT_LINE],
+        );
+        let provider = init_provider(&binary, cx);
+
+        let events = stream_events(&provider, cx).await.unwrap();
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert!(matches!(
+            events[0],
+            Ok(LanguageModelCompletionEvent::Started)
+        ));
+        assert!(matches!(
+            &events[1],
+            Ok(LanguageModelCompletionEvent::Text(text)) if text == "Hello"
+        ));
+        assert!(matches!(
+            events[2],
+            Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_stream_without_result_is_an_error(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let binary = fake_cli(directory.path(), &[HELLO_LINE]);
+        let provider = init_provider(&binary, cx);
+
+        let events = stream_events(&provider, cx).await.unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(
+            &events[0],
+            Ok(LanguageModelCompletionEvent::Text(text)) if text == "Hello"
+        ));
+        assert!(matches!(
+            events[1],
+            Err(LanguageModelCompletionError::StreamEndedUnexpectedly { .. })
+        ));
+    }
+
+    #[gpui::test]
+    async fn test_missing_binary(cx: &mut TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = init_provider(&directory.path().join("missing/claude"), cx);
+
+        assert!(!cx.update(|cx| provider.is_authenticated(cx)));
+        assert!(matches!(
+            stream_events(&provider, cx).await,
+            Err(LanguageModelCompletionError::NoApiKey { .. })
         ));
     }
 
