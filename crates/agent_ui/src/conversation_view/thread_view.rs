@@ -742,6 +742,22 @@ impl PermissionSelection {
     }
 }
 
+/// Up/Down recall of the messages sent in this thread, newest first.
+struct SentMessageNavigation {
+    /// Position in the sent messages, 0 being the most recent.
+    index: usize,
+    /// Composer contents before navigation started, restored after the newest message.
+    draft: Vec<acp_v2::ContentBlock>,
+    /// Composer text right after the recall; any other text means the user edited it.
+    recalled_text: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CursorLine {
+    First,
+    Last,
+}
+
 pub struct ThreadView {
     pub(crate) root_thread_id: ThreadId,
     pub session_id: acp_v2::SessionId,
@@ -786,6 +802,7 @@ pub struct ThreadView {
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
     pub message_queue: MessageQueue,
+    sent_message_navigation: Option<SentMessageNavigation>,
     pub turn_fields: TurnFields,
     pub discarded_partial_edits: HashSet<acp_v2::ToolCallId>,
     pub is_loading_contents: bool,
@@ -1330,6 +1347,7 @@ impl ThreadView {
             should_be_following: false,
             editing_message: None,
             message_queue: MessageQueue::default(),
+            sent_message_navigation: None,
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
             is_loading_contents: false,
@@ -3274,6 +3292,150 @@ impl ThreadView {
 
         cx.notify();
         true
+    }
+
+    fn sent_messages(&self, cx: &App) -> Vec<Vec<acp_v2::ContentBlock>> {
+        self.thread
+            .read(cx)
+            .entries()
+            .iter()
+            .rev()
+            .filter_map(|entry| {
+                let AgentThreadEntry::UserMessage(message) = entry else {
+                    return None;
+                };
+                let blocks = message.content.source_blocks();
+                (!blocks.is_empty() && blocks.iter().all(acp_thread::content::can_convert_to_v1))
+                    .then(|| blocks.to_vec())
+            })
+            .collect()
+    }
+
+    /// Whether the composer has a single caret on the given line and no menu that
+    /// should receive the arrow keys instead.
+    fn message_editor_cursor_on(&self, line: CursorLine, cx: &mut App) -> bool {
+        self.message_editor
+            .read(cx)
+            .editor()
+            .clone()
+            .update(cx, |editor, cx| {
+                if editor.context_menu_visible() || editor.selections.count() != 1 {
+                    return false;
+                }
+                let selection = editor
+                    .selections
+                    .newest::<Point>(&editor.display_snapshot(cx));
+                if !selection.is_empty() {
+                    return false;
+                }
+                match line {
+                    CursorLine::First => selection.head().row == 0,
+                    CursorLine::Last => {
+                        let max_row = editor.buffer().read(cx).snapshot(cx).max_point().row;
+                        selection.head().row == max_row
+                    }
+                }
+            })
+    }
+
+    fn show_in_message_editor(
+        &mut self,
+        content: Vec<acp_v2::ContentBlock>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> String {
+        self.message_editor.update(cx, |message_editor, cx| {
+            message_editor.set_message(content, window, cx);
+            message_editor.editor().update(cx, |editor, cx| {
+                editor.move_to_end(&editor::actions::MoveToEnd, window, cx);
+            });
+            message_editor.text(cx)
+        })
+    }
+
+    /// Drops the navigation state when the composer no longer shows the recalled message.
+    fn sync_sent_message_navigation(&mut self, cx: &App) {
+        let current_text = self.message_editor.read(cx).text(cx);
+        if self
+            .sent_message_navigation
+            .as_ref()
+            .is_some_and(|navigation| navigation.recalled_text != current_text)
+        {
+            self.sent_message_navigation = None;
+        }
+    }
+
+    fn recall_older_sent_message(
+        &mut self,
+        _: &zed_actions::editor::MoveUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_sent_message_navigation(cx);
+        let editor_is_empty = self.message_editor.read(cx).is_empty(cx);
+        // An empty composer with queued messages takes the queued one instead.
+        if editor_is_empty && self.message_queue.last_id().is_some() {
+            return;
+        }
+        if !self.message_editor_cursor_on(CursorLine::First, cx) {
+            return;
+        }
+        let sent_messages = self.sent_messages(cx);
+        let next_index = match &self.sent_message_navigation {
+            Some(navigation) => navigation.index + 1,
+            None => 0,
+        };
+        let Some(content) = sent_messages.get(next_index).cloned() else {
+            if self.sent_message_navigation.is_some() {
+                cx.stop_propagation();
+            }
+            return;
+        };
+        let draft = match self.sent_message_navigation.take() {
+            Some(navigation) => navigation.draft,
+            None => self
+                .message_editor
+                .read(cx)
+                .draft_content_blocks_snapshot(cx),
+        };
+        let recalled_text = self.show_in_message_editor(content, window, cx);
+        self.sent_message_navigation = Some(SentMessageNavigation {
+            index: next_index,
+            draft,
+            recalled_text,
+        });
+        cx.stop_propagation();
+    }
+
+    fn recall_newer_sent_message(
+        &mut self,
+        _: &zed_actions::editor::MoveDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_sent_message_navigation(cx);
+        if self.sent_message_navigation.is_none()
+            || !self.message_editor_cursor_on(CursorLine::Last, cx)
+        {
+            return;
+        }
+        let Some(navigation) = self.sent_message_navigation.take() else {
+            return;
+        };
+        if navigation.index == 0 {
+            self.show_in_message_editor(navigation.draft, window, cx);
+        } else {
+            let index = navigation.index - 1;
+            if let Some(content) = self.sent_messages(cx).get(index).cloned() {
+                let recalled_text = self.show_in_message_editor(content, window, cx);
+                self.sent_message_navigation = Some(SentMessageNavigation {
+                    index,
+                    draft: navigation.draft,
+                    recalled_text,
+                });
+            }
+        }
+        cx.stop_propagation();
     }
 
     fn handle_message_editor_move_up(
@@ -5615,6 +5777,8 @@ impl ThreadView {
             .py_2()
             .bg(editor_bg_color)
             .justify_center()
+            .capture_action(cx.listener(Self::recall_older_sent_message))
+            .capture_action(cx.listener(Self::recall_newer_sent_message))
             .on_action(cx.listener(Self::handle_message_editor_move_up))
             .map(|this| {
                 if has_messages {

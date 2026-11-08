@@ -20607,6 +20607,118 @@ pub(crate) mod tests {
         assert_eq!(text, "second queued");
     }
 
+    async fn send_text(
+        conversation_view: &Entity<ConversationView>,
+        text: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        message_editor(conversation_view, cx)
+            .update_in(cx, |editor, window, cx| editor.set_text(text, window, cx));
+        active_thread(conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+    }
+
+    fn press(
+        editor: &Entity<MessageEditor>,
+        action: impl gpui::Action,
+        cx: &mut VisualTestContext,
+    ) -> String {
+        editor.update_in(cx, |_editor, window, cx| {
+            window.dispatch_action(Box::new(action), cx);
+        });
+        cx.run_until_parked();
+        editor.update(cx, |editor, cx| editor.text(cx))
+    }
+
+    #[gpui::test]
+    async fn test_up_and_down_cycle_sent_message_history(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        send_text(&conversation_view, "first", cx).await;
+        send_text(&conversation_view, "second\nline two", cx).await;
+
+        let editor = message_editor(&conversation_view, cx);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("draft", window, cx)
+        });
+        cx.focus(&editor);
+
+        use zed_actions::editor::{MoveDown, MoveUp};
+        assert_eq!(press(&editor, MoveUp, cx), "second\nline two");
+        // The cursor lands at the end of the recalled message, so Up first walks its lines.
+        assert_eq!(press(&editor, MoveUp, cx), "second\nline two");
+        assert_eq!(press(&editor, MoveUp, cx), "first");
+        assert_eq!(
+            press(&editor, MoveUp, cx),
+            "first",
+            "the oldest message stays"
+        );
+        assert_eq!(press(&editor, MoveDown, cx), "second\nline two");
+        assert_eq!(
+            press(&editor, MoveDown, cx),
+            "draft",
+            "the draft comes back last"
+        );
+        assert_eq!(press(&editor, MoveDown, cx), "draft");
+    }
+
+    #[gpui::test]
+    async fn test_editing_recalled_message_stops_history_navigation(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        send_text(&conversation_view, "first", cx).await;
+
+        let editor = message_editor(&conversation_view, cx);
+        cx.focus(&editor);
+
+        use zed_actions::editor::{MoveDown, MoveUp};
+        assert_eq!(press(&editor, MoveUp, cx), "first");
+        editor.update_in(cx, |editor, window, cx| {
+            editor
+                .editor()
+                .update(cx, |editor, cx| editor.insert(" edited", window, cx));
+        });
+        assert_eq!(
+            press(&editor, MoveDown, cx),
+            "first edited",
+            "an edited message is a draft, so Down moves the cursor"
+        );
+        assert_eq!(
+            press(&editor, MoveUp, cx),
+            "first",
+            "Up recalls history again, keeping the edit as the draft"
+        );
+        assert_eq!(press(&editor, MoveDown, cx), "first edited");
+    }
+
+    #[gpui::test]
+    async fn test_up_inside_multiline_draft_moves_the_cursor(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        send_text(&conversation_view, "first", cx).await;
+
+        let editor = message_editor(&conversation_view, cx);
+        editor.update_in(cx, |editor, window, cx| editor.set_text("a\nb", window, cx));
+        cx.focus(&editor);
+
+        assert_eq!(
+            press(&editor, zed_actions::editor::MoveUp, cx),
+            "a\nb",
+            "Up on the last line of a multi-line draft moves the cursor"
+        );
+        assert_eq!(press(&editor, zed_actions::editor::MoveUp, cx), "first");
+    }
+
     #[gpui::test]
     async fn test_paste_text_into_queued_message_promotes_to_main_editor(cx: &mut TestAppContext) {
         init_test(cx);
