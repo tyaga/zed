@@ -828,6 +828,11 @@ pub struct GitPanelSettingsContent {
     /// Default: true
     pub generate_commit_message_button: Option<bool>,
 
+    /// Whether to hide merge commits in the History tab.
+    ///
+    /// Default: false
+    pub hide_merge_commits: Option<bool>,
+
     /// Default action when clicking a changed file in the Git panel.
     ///
     /// Default: project_diff

@@ -34,6 +34,7 @@ pub struct GitPanelSettings {
     pub starts_open: bool,
     pub commit_title_max_length: usize,
     pub generate_commit_message_button: bool,
+    pub hide_merge_commits: bool,
     pub entry_primary_click_action: GitPanelClickBehavior,
     pub commit_editor: GitPanelCommitEditor,
 }
@@ -86,6 +87,7 @@ impl Settings for GitPanelSettings {
             starts_open: git_panel.starts_open.unwrap(),
             commit_title_max_length: git_panel.commit_title_max_length.unwrap(),
             generate_commit_message_button: git_panel.generate_commit_message_button.unwrap(),
+            hide_merge_commits: git_panel.hide_merge_commits.unwrap(),
             entry_primary_click_action: git_panel.entry_primary_click_action.unwrap(),
             commit_editor: git_panel.commit_editor.unwrap(),
         }

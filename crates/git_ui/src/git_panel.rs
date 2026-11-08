@@ -1379,6 +1379,7 @@ pub struct GitPanel {
     active_tab: GitPanelTab,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history: CommitHistory,
+    visible_commit_history: Rc<[CommitHistoryEntry]>,
     focused_history_entry: Option<usize>,
     active_history_sha: Option<Oid>,
     history_keyboard_nav: bool,
@@ -1409,12 +1410,29 @@ struct BulkStaging {
 struct CommitHistoryEntry {
     sha: Oid,
     tag_names: Vec<SharedString>,
+    is_merge: bool,
+    /// Index in the unfiltered history; hiding merges shifts row indices, but
+    /// the unpushed marker counts commits from the head of the full list.
+    position: usize,
+}
+
+fn visible_commit_history(
+    entries: &[CommitHistoryEntry],
+    hide_merge_commits: bool,
+) -> Rc<[CommitHistoryEntry]> {
+    entries
+        .iter()
+        .filter(|entry| !(hide_merge_commits && entry.is_merge))
+        .cloned()
+        .collect()
 }
 
 impl From<&Arc<InitialGraphCommitData>> for CommitHistoryEntry {
     fn from(commit: &Arc<InitialGraphCommitData>) -> Self {
         Self {
             sha: commit.sha,
+            is_merge: commit.parents.len() > 1,
+            position: 0,
             tag_names: commit
                 .tag_names()
                 .into_iter()
@@ -1559,6 +1577,7 @@ impl GitPanel {
             let mut was_diff_stats = GitPanelSettings::get_global(cx).diff_stats;
             let mut was_commit_editor = GitPanelSettings::get_global(cx).commit_editor;
             let mut was_date_style = GitPanelSettings::get_global(cx).date_style;
+            let mut was_hide_merge_commits = GitPanelSettings::get_global(cx).hide_merge_commits;
             let mut was_date_format = ProjectSettings::get_global(cx).git.date_format.clone();
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
                 let settings = GitPanelSettings::get_global(cx);
@@ -1570,6 +1589,7 @@ impl GitPanel {
                 let diff_stats = settings.diff_stats;
                 let commit_editor = settings.commit_editor;
                 let date_style = settings.date_style;
+                let hide_merge_commits = settings.hide_merge_commits;
                 let date_format = ProjectSettings::get_global(cx).git.date_format.clone();
                 // Changing the setting is an explicit request, so it wins over
                 // whatever this workspace last persisted.
@@ -1593,6 +1613,11 @@ impl GitPanel {
                         }
                         _ => {}
                     }
+                }
+
+                if hide_merge_commits != was_hide_merge_commits {
+                    this.refresh_visible_commit_history(true, cx);
+                    cx.notify();
                 }
 
                 let mut update_entries = false;
@@ -1619,6 +1644,7 @@ impl GitPanel {
                 was_diff_stats = diff_stats;
                 was_commit_editor = commit_editor;
                 was_date_style = date_style;
+                was_hide_merge_commits = hide_merge_commits;
                 was_date_format = date_format;
             })
             .detach();
@@ -1767,6 +1793,7 @@ impl GitPanel {
                 active_tab: GitPanelTab::Changes,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history: CommitHistory::Loading,
+                visible_commit_history: Rc::from([]),
                 focused_history_entry: None,
                 active_history_sha: None,
                 history_keyboard_nav: false,
@@ -8033,27 +8060,45 @@ impl GitPanel {
     }
 
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().flex_1().size_full().overflow_hidden().map(|this| {
-            let has_repo = self.active_repository.is_some();
-            match &self.commit_history {
-                _ if !has_repo => {
-                    this.child(Self::render_history_placeholder("No repository found"))
+        let hide_merge_commits = GitPanelSettings::get_global(cx).hide_merge_commits;
+        v_flex()
+            .flex_1()
+            .size_full()
+            .overflow_hidden()
+            .child(
+                h_flex().px_2().py_1().child(
+                    Checkbox::new("hide-merge-commits", hide_merge_commits.into())
+                        .label("Hide merge commits")
+                        .label_size(LabelSize::Small)
+                        .label_color(Color::Muted)
+                        .on_click(cx.listener(|this, state: &ToggleState, _, cx| {
+                            this.set_hide_merge_commits(state.selected(), cx);
+                        })),
+                ),
+            )
+            .map(|this| {
+                let has_repo = self.active_repository.is_some();
+                match &self.commit_history {
+                    _ if !has_repo => {
+                        this.child(Self::render_history_placeholder("No repository found"))
+                    }
+                    CommitHistory::Error(_) => this.child(Self::render_history_placeholder(
+                        "Failed to load commit history",
+                    )),
+                    CommitHistory::Loading => {
+                        this.child(Self::render_history_placeholder("Loading Commit History…"))
+                    }
+                    CommitHistory::Loaded(_) if self.visible_commit_history.is_empty() => {
+                        this.child(Self::render_history_placeholder("No commits yet"))
+                    }
+                    CommitHistory::Loaded(_) => match self.render_commit_history(window, cx) {
+                        Some(history) => this.child(history),
+                        None => {
+                            this.child(Self::render_history_placeholder("Failed to load commits"))
+                        }
+                    },
                 }
-                CommitHistory::Error(_) => this.child(Self::render_history_placeholder(
-                    "Failed to load commit history",
-                )),
-                CommitHistory::Loading => {
-                    this.child(Self::render_history_placeholder("Loading Commit History…"))
-                }
-                CommitHistory::Loaded(entries) if entries.is_empty() => {
-                    this.child(Self::render_history_placeholder("No commits yet"))
-                }
-                CommitHistory::Loaded(_) => match self.render_commit_history(window, cx) {
-                    Some(history) => this.child(history),
-                    None => this.child(Self::render_history_placeholder("Failed to load commits")),
-                },
-            }
-        })
+            })
     }
 
     fn render_history_placeholder(message: &'static str) -> impl IntoElement {
@@ -8064,10 +8109,53 @@ impl GitPanel {
     }
 
     fn commit_history_entries(&self) -> &[CommitHistoryEntry] {
-        match &self.commit_history {
-            CommitHistory::Loaded(entries) => entries,
-            CommitHistory::Loading | CommitHistory::Error(_) => &[],
+        &self.visible_commit_history
+    }
+
+    fn set_hide_merge_commits(&mut self, hide: bool, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            let fs = workspace.read(cx).app_state().fs.clone();
+            cx.update_global::<SettingsStore, _>(|store, _cx| {
+                store.update_settings_file(fs, move |settings, _cx| {
+                    settings
+                        .git_panel
+                        .get_or_insert_default()
+                        .hide_merge_commits = Some(hide);
+                });
+            });
         }
+    }
+
+    fn refresh_visible_commit_history(&mut self, keep_focused_commit: bool, cx: &App) {
+        let focused_sha = self
+            .focused_history_entry
+            .and_then(|index| self.visible_commit_history.get(index))
+            .map(|entry| entry.sha);
+        self.visible_commit_history = match &self.commit_history {
+            CommitHistory::Loaded(entries) => {
+                visible_commit_history(entries, GitPanelSettings::get_global(cx).hide_merge_commits)
+            }
+            CommitHistory::Loading | CommitHistory::Error(_) => Rc::from([]),
+        };
+        if keep_focused_commit {
+            self.focused_history_entry = focused_sha.and_then(|sha| {
+                self.visible_commit_history
+                    .iter()
+                    .position(|entry| entry.sha == sha)
+            });
+        }
+        self.clamp_focused_history_entry();
+    }
+
+    /// Keeps the focused entry within range as the history grows or clears,
+    /// starting from the active commit when nothing is focused yet.
+    fn clamp_focused_history_entry(&mut self) {
+        let count = self.visible_commit_history.len();
+        let focused = self
+            .focused_history_entry
+            .or_else(|| self.active_history_entry_index());
+        self.focused_history_entry =
+            focused.and_then(|focused| (count > 0).then(|| focused.min(count - 1)));
     }
 
     fn active_history_entry_index(&self) -> Option<usize> {
@@ -8287,7 +8375,11 @@ impl GitPanel {
             let entries: Rc<[CommitHistoryEntry]> = response
                 .commits
                 .iter()
-                .map(CommitHistoryEntry::from)
+                .enumerate()
+                .map(|(position, commit)| CommitHistoryEntry {
+                    position,
+                    ..CommitHistoryEntry::from(commit)
+                })
                 .collect();
             (entries, response.is_loading, response.error)
         });
@@ -8298,14 +8390,7 @@ impl GitPanel {
     fn set_commit_history(&mut self, commit_history: CommitHistory, cx: &mut Context<Self>) {
         let changed = self.commit_history != commit_history;
         self.commit_history = commit_history;
-        // Keep the focused entry within range as the history grows or clears,
-        // starting from the active commit when nothing is focused yet.
-        let count = self.commit_history_entries().len();
-        let focused = self
-            .focused_history_entry
-            .or_else(|| self.active_history_entry_index());
-        self.focused_history_entry =
-            focused.and_then(|focused| (count > 0).then(|| focused.min(count - 1)));
+        self.refresh_visible_commit_history(false, cx);
         if changed {
             cx.notify();
         }
@@ -8341,10 +8426,10 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let CommitHistory::Loaded(entries) = &self.commit_history else {
+        let CommitHistory::Loaded(_) = &self.commit_history else {
             return None;
         };
-        let entries = entries.clone();
+        let entries = self.visible_commit_history.clone();
         let active_repository = self.active_repository.as_ref()?;
         let workspace = self.workspace.clone();
         let repo_weak = active_repository.downgrade();
@@ -8451,7 +8536,7 @@ impl GitPanel {
                                     .size(px(14.))
                                     .render(window, cx);
 
-                                    let is_unpushed = index < ahead_count;
+                                    let is_unpushed = entry.position < ahead_count;
                                     let is_focused = focused_history_entry == Some(index);
                                     let is_active = active_history_sha == Some(entry.sha);
                                     let is_context_menu_target =
@@ -11744,6 +11829,8 @@ mod tests {
                 CommitHistory::Loaded(Rc::from([CommitHistoryEntry {
                     sha,
                     tag_names: Vec::new(),
+                    is_merge: false,
+                    position: 0,
                 }]))
             );
         });
@@ -12030,6 +12117,116 @@ mod tests {
         );
     }
 
+    fn history_entry(byte: u8, is_merge: bool, position: usize) -> CommitHistoryEntry {
+        CommitHistoryEntry {
+            sha: Oid::from_bytes(&[byte; 20]).unwrap(),
+            tag_names: Vec::new(),
+            is_merge,
+            position,
+        }
+    }
+
+    #[test]
+    fn test_visible_commit_history_hides_merges() {
+        let entries = [
+            history_entry(1, true, 0),
+            history_entry(2, false, 1),
+            history_entry(3, true, 2),
+            history_entry(4, false, 3),
+        ];
+
+        let hidden = visible_commit_history(&entries, true);
+        assert_eq!(
+            hidden.iter().map(|entry| entry.sha).collect::<Vec<_>>(),
+            vec![entries[1].sha, entries[3].sha]
+        );
+        assert_eq!(
+            hidden
+                .iter()
+                .map(|entry| entry.position)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(visible_commit_history(&entries, false).len(), 4);
+    }
+
+    #[test]
+    fn test_unpushed_marker_uses_unfiltered_position() {
+        let entries = [
+            history_entry(1, true, 0),
+            history_entry(2, false, 1),
+            history_entry(3, false, 2),
+        ];
+        let ahead_count = 2;
+
+        let visible = visible_commit_history(&entries, true);
+        let unpushed: Vec<bool> = visible
+            .iter()
+            .map(|entry| entry.position < ahead_count)
+            .collect();
+        assert_eq!(unpushed, vec![true, false]);
+    }
+
+    async fn set_hide_merge_commits(test: &mut HistoryPanelTest, hide: bool) {
+        test.cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .git_panel
+                        .get_or_insert_default()
+                        .hide_merge_commits = Some(hide);
+                })
+            });
+        });
+        test.cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_hide_merge_commits_keeps_focus_in_range(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (mut test, _) = history_panel_with_commits(cx).await;
+        let merge = history_entry(10, true, 0);
+        let regular = history_entry(11, false, 1);
+        test.panel.update(&mut test.cx, |panel, cx| {
+            panel.set_commit_history(
+                CommitHistory::Loaded(Rc::from([merge.clone(), regular.clone()])),
+                cx,
+            );
+            panel.focused_history_entry = Some(1);
+        });
+
+        set_hide_merge_commits(&mut test, true).await;
+
+        test.panel.read_with(&test.cx, |panel, _| {
+            assert_eq!(panel.focused_history_entry, Some(0));
+            assert_eq!(panel.commit_history_entries()[0].sha, regular.sha);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_only_merge_commits_shows_placeholder(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (mut test, _) = history_panel_with_commits(cx).await;
+        test.panel.update(&mut test.cx, |panel, cx| {
+            panel.set_commit_history(
+                CommitHistory::Loaded(Rc::from([
+                    history_entry(10, true, 0),
+                    history_entry(11, true, 1),
+                ])),
+                cx,
+            );
+            panel.focused_history_entry = Some(1);
+        });
+
+        set_hide_merge_commits(&mut test, true).await;
+
+        test.panel.read_with(&test.cx, |panel, _| {
+            assert!(panel.commit_history_entries().is_empty());
+            assert_eq!(panel.focused_history_entry, None);
+        });
+        test.cx.run_until_parked();
+    }
+
     #[test]
     fn test_commit_history_from_response() {
         let sha: Oid = "0123456789012345678901234567890123456789".parse().unwrap();
@@ -12037,6 +12234,8 @@ mod tests {
         let entries: Rc<[CommitHistoryEntry]> = Rc::from([CommitHistoryEntry {
             sha,
             tag_names: Vec::new(),
+            is_merge: false,
+            position: 0,
         }]);
         let no_entries: Rc<[CommitHistoryEntry]> = Rc::from([]);
 

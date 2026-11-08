@@ -6582,7 +6582,7 @@ fn panels_page() -> SettingsPage {
         ]
     }
 
-    fn git_panel_section() -> [SettingsPageItem; 21] {
+    fn git_panel_section() -> [SettingsPageItem; 22] {
         [
             SettingsPageItem::SectionHeader("Git Panel"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -6918,6 +6918,29 @@ fn panels_page() -> SettingsPage {
                             .git_panel
                             .get_or_insert_default()
                             .generate_commit_message_button = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Hide Merge Commits",
+                description: "Whether to hide merge commits in the History tab.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("git_panel.hide_merge_commits"),
+                    pick: |settings_content| {
+                        settings_content
+                            .git_panel
+                            .as_ref()?
+                            .hide_merge_commits
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .git_panel
+                            .get_or_insert_default()
+                            .hide_merge_commits = value;
                     },
                 }),
                 metadata: None,

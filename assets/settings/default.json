@@ -1169,6 +1169,10 @@
     //
     // Default: true
     "generate_commit_message_button": true,
+    // Whether to hide merge commits in the History tab.
+    //
+    // Default: false
+    "hide_merge_commits": false,
     // Default action when clicking a changed file in the Git panel.
     //
     // Choices: project_diff, file_diff, view_file
