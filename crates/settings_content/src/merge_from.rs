@@ -156,6 +156,18 @@ where
     }
 }
 
+impl MergeFrom for serde_json::Map<String, serde_json::Value> {
+    fn merge_from(&mut self, other: &Self) {
+        for (key, value) in other {
+            if let Some(existing) = self.get_mut(key) {
+                existing.merge_from(value);
+            } else {
+                self.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 impl MergeFrom for serde_json::Value {
     fn merge_from(&mut self, other: &Self) {
         match (self, other) {

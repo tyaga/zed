@@ -163,6 +163,19 @@ pub async fn connect(
     })
 }
 
+/// Read on every session request so settings edits reach the next session without
+/// restarting the agent.
+fn configured_session_meta(
+    agent_id: &AgentId,
+    cx: &App,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    cx.try_global::<settings::SettingsStore>()?
+        .get::<project::agent_server_store::AllAgentServersSettings>(None)
+        .get(agent_id.as_ref())?
+        .session_meta()
+        .cloned()
+}
+
 fn v1_only_mismatch(error: &agent_client_protocol::Error) -> bool {
     if error.code != agent_client_protocol::Error::new(-32022, "").code {
         return false;

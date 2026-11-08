@@ -887,6 +887,11 @@ pub enum CustomAgentServerSettings {
         /// Default: {}
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         favorite_config_option_values: HashMap<String, Vec<String>>,
+        /// A JSON object sent as `_meta` with every session/new, session/load
+        /// and session/resume request to this agent.
+        ///
+        /// Default: None
+        session_meta: Option<serde_json::Map<String, serde_json::Value>>,
     },
     // Used for the ACP extension migration
     #[serde(alias = "extension")]
@@ -916,6 +921,11 @@ pub enum CustomAgentServerSettings {
         /// Default: {}
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         favorite_config_option_values: HashMap<String, Vec<String>>,
+        /// A JSON object sent as `_meta` with every session/new, session/load
+        /// and session/resume request to this agent.
+        ///
+        /// Default: None
+        session_meta: Option<serde_json::Map<String, serde_json::Value>>,
     },
 }
 
@@ -1200,6 +1210,59 @@ mod tests {
             serde_json::from_value::<AgentConfigOptionValue>(serde_json::json!(true))
                 .expect("deserialize boolean"),
             AgentConfigOptionValue::Boolean(true)
+        );
+    }
+
+    fn claude_extra_args_meta() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::json!({ "claudeCode": { "options": { "extraArgs": { "chrome": "" } } } })
+            .as_object()
+            .cloned()
+            .expect("object literal")
+    }
+
+    #[test]
+    fn registry_agent_settings_deserialize_session_meta() {
+        let settings = serde_json::from_value::<CustomAgentServerSettings>(serde_json::json!({
+            "type": "registry",
+            "session_meta": { "claudeCode": { "options": { "extraArgs": { "chrome": "" } } } }
+        }))
+        .expect("deserialize registry agent");
+
+        let CustomAgentServerSettings::Registry { session_meta, .. } = settings else {
+            panic!("expected a registry agent, got {settings:?}");
+        };
+        assert_eq!(session_meta, Some(claude_extra_args_meta()));
+    }
+
+    #[test]
+    fn custom_agent_settings_deserialize_session_meta() {
+        let settings = serde_json::from_value::<CustomAgentServerSettings>(serde_json::json!({
+            "type": "custom",
+            "command": "agent",
+            "session_meta": { "claudeCode": { "options": { "extraArgs": { "chrome": "" } } } }
+        }))
+        .expect("deserialize custom agent");
+
+        let CustomAgentServerSettings::Custom { session_meta, .. } = settings else {
+            panic!("expected a custom agent, got {settings:?}");
+        };
+        assert_eq!(session_meta, Some(claude_extra_args_meta()));
+    }
+
+    #[test]
+    fn agent_settings_without_session_meta_omit_it_when_serialized() {
+        let settings = serde_json::from_value::<CustomAgentServerSettings>(serde_json::json!({
+            "type": "registry"
+        }))
+        .expect("deserialize registry agent");
+
+        let CustomAgentServerSettings::Registry { session_meta, .. } = &settings else {
+            panic!("expected a registry agent, got {settings:?}");
+        };
+        assert_eq!(session_meta, &None);
+        assert_eq!(
+            serde_json::to_value(&settings).expect("serialize registry agent"),
+            serde_json::json!({ "type": "registry" })
         );
     }
 

@@ -2,9 +2,10 @@ use super::{
     AcpDebugLog, AcpDebugMessage, AcpSession, ClientContext, ConfigOptions,
     ContextServerConfiguration, ForegroundWork, PendingSessionUpdates, ReadOnlyConfigOptions,
     UnsupportedVersion, apply_v2_session_notification, close_undelivered_session,
-    drain_foreground_queue, enqueue_notification, first_class_terminal_auth_task,
-    is_disconnect_error, is_resource_not_found, map_acp_error, mcp_configurations_for_project,
-    runtime, transport, with_v2_client_ingress, work_dirs_from_session_info,
+    configured_session_meta, drain_foreground_queue, enqueue_notification,
+    first_class_terminal_auth_task, is_disconnect_error, is_resource_not_found, map_acp_error,
+    mcp_configurations_for_project, runtime, transport, with_v2_client_ingress,
+    work_dirs_from_session_info,
 };
 use acp_thread::{
     AcpThread, AgentConnection, AgentSessionConfigOptions, AgentSessionInfo, AgentSessionList,
@@ -1053,7 +1054,8 @@ impl AcpV2Connection {
         }
         let mut request = acp::ResumeSessionRequest::new(session_id.clone(), context.cwd.clone())
             .additional_directories(context.additional_directories.clone())
-            .mcp_servers(context.mcp_servers.clone());
+            .mcp_servers(context.mcp_servers.clone())
+            .meta(configured_session_meta(&self.id, cx));
         if replay_history {
             request = request.replay_from(acp::ReplayFrom::Start(acp::ReplayFromStart::new()));
         }
@@ -1335,7 +1337,8 @@ impl AgentConnection for AcpV2Connection {
         };
         let mut request = acp::NewSessionRequest::new(context.cwd.clone())
             .additional_directories(context.additional_directories.clone())
-            .mcp_servers(context.mcp_servers.clone());
+            .mcp_servers(context.mcp_servers.clone())
+            .meta(configured_session_meta(&self.id, cx));
         if self.supports_initial_config_options(cx) {
             // `apply_new_session_defaults` still runs after creation, so defaults the agent
             // ignored here (for example, ones that depend on another option) get another chance.
@@ -2504,12 +2507,81 @@ mod tests {
                         default_mode: Some("legacy-must-not-run".into()),
                         default_config_options: defaults,
                         favorite_config_option_values: HashMap::default(),
+                        session_meta: None,
                     }
                     .into(),
                 )])),
                 cx,
             );
         });
+    }
+
+    fn set_session_meta(session_meta: Option<acp::Meta>, cx: &mut TestAppContext) {
+        use project::agent_server_store::AllAgentServersSettings;
+        use settings::Settings;
+
+        cx.update(|cx| {
+            AllAgentServersSettings::override_global(
+                AllAgentServersSettings(HashMap::from_iter([(
+                    "session-test".into(),
+                    settings::CustomAgentServerSettings::Registry {
+                        env: HashMap::default(),
+                        default_mode: None,
+                        default_config_options: HashMap::default(),
+                        favorite_config_option_values: HashMap::default(),
+                        session_meta,
+                    }
+                    .into(),
+                )])),
+                cx,
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn v2_configured_session_meta_is_sent_with_session_requests(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let session_meta = acp::Meta::from_iter([(
+            "claudeCode".to_owned(),
+            json!({ "options": { "extraArgs": { "chrome": "" } } }),
+        )]);
+        set_session_meta(Some(session_meta.clone()), cx);
+
+        let mut creation = harness.create(cx);
+        let (request, _) = harness.new_request(&mut creation, cx).await;
+        assert_eq!(request.meta, Some(session_meta.clone()));
+        harness
+            .new_responses
+            .try_send(Ok(initial_response()))
+            .expect("new response");
+        bounded(creation, cx).await.expect("create thread");
+
+        let _reopening = harness.reopen(true, cx);
+        let (request, _responder) = bounded(harness.resume_requests.recv(), cx)
+            .await
+            .expect("resume request");
+        assert_eq!(request.meta, Some(session_meta));
+    }
+
+    #[gpui::test]
+    async fn v2_session_requests_omit_meta_without_session_meta_setting(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        set_session_meta(None, cx);
+
+        let mut creation = harness.create(cx);
+        let (request, _) = harness.new_request(&mut creation, cx).await;
+        assert_eq!(request.meta, None);
+        harness
+            .new_responses
+            .try_send(Ok(initial_response()))
+            .expect("new response");
+        bounded(creation, cx).await.expect("create thread");
+
+        let _reopening = harness.reopen(false, cx);
+        let (request, _responder) = bounded(harness.resume_requests.recv(), cx)
+            .await
+            .expect("resume request");
+        assert_eq!(request.meta, None);
     }
 
     #[gpui::test]
@@ -7941,6 +8013,7 @@ done
                         default_mode: None,
                         default_config_options: HashMap::default(),
                         favorite_config_option_values: HashMap::default(),
+                        session_meta: None,
                     }
                     .into(),
                 )])),

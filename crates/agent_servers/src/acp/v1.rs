@@ -1,10 +1,11 @@
 use super::{
     AcpDebugLog, AcpDebugMessage, AcpSession, ClientContext, ConfigOptions, FlattenAcpResult as _,
     ForegroundWork, ReadOnlyConfigOptions, UnsupportedVersion, apply_subagent_update,
-    drain_foreground_queue, enqueue_notification, enqueue_request, first_class_terminal_auth_task,
-    handle_v2_complete_elicitation, handle_v2_create_elicitation, map_acp_error,
-    mcp_configurations_for_project, respond_err, respond_result, runtime, session_thread,
-    terminal_auth_task_id, transport, with_v2_client_ingress, work_dirs_from_session_info,
+    configured_session_meta, drain_foreground_queue, enqueue_notification, enqueue_request,
+    first_class_terminal_auth_task, handle_v2_complete_elicitation, handle_v2_create_elicitation,
+    map_acp_error, mcp_configurations_for_project, respond_err, respond_result, runtime,
+    session_thread, terminal_auth_task_id, transport, with_v2_client_ingress,
+    work_dirs_from_session_info,
 };
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
@@ -1224,30 +1225,39 @@ struct SessionDirectories {
 }
 
 impl SessionDirectories {
-    fn into_new_session_request(self, mcp_servers: Vec<acp::McpServer>) -> acp::NewSessionRequest {
+    fn into_new_session_request(
+        self,
+        mcp_servers: Vec<acp::McpServer>,
+        meta: Option<acp::Meta>,
+    ) -> acp::NewSessionRequest {
         acp::NewSessionRequest::new(self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
     }
 
     fn into_load_session_request(
         self,
         session_id: acp_v2::SessionId,
         mcp_servers: Vec<acp::McpServer>,
+        meta: Option<acp::Meta>,
     ) -> acp::LoadSessionRequest {
         acp::LoadSessionRequest::new(acp::SessionId::new(session_id.0), self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
     }
 
     fn into_resume_session_request(
         self,
         session_id: acp_v2::SessionId,
         mcp_servers: Vec<acp::McpServer>,
+        meta: Option<acp::Meta>,
     ) -> acp::ResumeSessionRequest {
         acp::ResumeSessionRequest::new(acp::SessionId::new(session_id.0), self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
     }
 }
 
@@ -1345,11 +1355,12 @@ impl AgentConnection for AcpConnection {
         let name = self.id.0.clone();
         let mcp_servers = mcp_servers_for_project(&project, cx);
         let sends_initial_config_options = self.agent_supports_initial_config_options(cx);
+        let session_meta = configured_session_meta(&self.id, cx);
 
         cx.spawn(async move |cx| {
             let (response_sender, response_received) = futures::channel::oneshot::channel();
             let (registered, registration_finished) = futures::channel::oneshot::channel();
-            let mut request = directories.into_new_session_request(mcp_servers);
+            let mut request = directories.into_new_session_request(mcp_servers, session_meta);
             if sends_initial_config_options {
                 // The default-application pass below still runs, so defaults the agent ignored
                 // here (for example, ones that depend on another option) get another chance.
@@ -1536,6 +1547,7 @@ impl AgentConnection for AcpConnection {
         }
 
         let mcp_servers = mcp_servers_for_project(&project, cx);
+        let session_meta = configured_session_meta(&self.id, cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -1546,7 +1558,11 @@ impl AgentConnection for AcpConnection {
                 Box::pin(async move {
                     let response = ordered_response(
                         &connection,
-                        directories.into_load_session_request(session_id.clone(), mcp_servers),
+                        directories.into_load_session_request(
+                            session_id.clone(),
+                            mcp_servers,
+                            session_meta,
+                        ),
                         applied,
                     )
                     .await?;
@@ -1580,6 +1596,7 @@ impl AgentConnection for AcpConnection {
         }
 
         let mcp_servers = mcp_servers_for_project(&project, cx);
+        let session_meta = configured_session_meta(&self.id, cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -1590,7 +1607,11 @@ impl AgentConnection for AcpConnection {
                 Box::pin(async move {
                     let response = ordered_response(
                         &connection,
-                        directories.into_resume_session_request(session_id.clone(), mcp_servers),
+                        directories.into_resume_session_request(
+                            session_id.clone(),
+                            mcp_servers,
+                            session_meta,
+                        ),
                         applied,
                     )
                     .await?;
@@ -1949,6 +1970,7 @@ pub mod test_support {
         pub close_session_count: Arc<AtomicUsize>,
         pub authenticate_count: Arc<AtomicUsize>,
         pub logout_count: Arc<AtomicUsize>,
+        pub session_request_metas: Arc<Mutex<Vec<Option<acp::Meta>>>>,
         pub keep_agent_alive: Task<anyhow::Result<()>>,
     }
 
@@ -2138,6 +2160,7 @@ pub mod test_support {
 
         let authenticate_count = Arc::new(AtomicUsize::new(0));
         let logout_count = Arc::new(AtomicUsize::new(0));
+        let session_request_metas = Arc::new(Mutex::new(Vec::new()));
         let sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>> =
             Rc::new(RefCell::new(HashMap::default()));
         let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
@@ -2208,8 +2231,16 @@ pub mod test_support {
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
-                async move |_req: acp::NewSessionRequest, responder, _cx| {
-                    responder.respond(acp::NewSessionResponse::new(acp::SessionId::new("unused")))
+                {
+                    let session_request_metas = session_request_metas.clone();
+                    async move |request: acp::NewSessionRequest, responder, _cx| {
+                        session_request_metas
+                            .lock()
+                            .expect("session request metas lock should not be poisoned")
+                            .push(request.meta);
+                        responder
+                            .respond(acp::NewSessionResponse::new(acp::SessionId::new("unused")))
+                    }
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -2230,8 +2261,13 @@ pub mod test_support {
             .on_receive_request(
                 {
                     let load_session_count = load_session_count.clone();
-                    async move |_req: acp::LoadSessionRequest, responder, _cx| {
+                    let session_request_metas = session_request_metas.clone();
+                    async move |request: acp::LoadSessionRequest, responder, _cx| {
                         load_session_count.fetch_add(1, Ordering::SeqCst);
+                        session_request_metas
+                            .lock()
+                            .expect("session request metas lock should not be poisoned")
+                            .push(request.meta);
                         responder.respond(acp::LoadSessionResponse::new())
                     }
                 },
@@ -2343,6 +2379,7 @@ pub mod test_support {
             close_session_count,
             authenticate_count,
             logout_count,
+            session_request_metas,
             keep_agent_alive,
         })
     }
@@ -5827,6 +5864,7 @@ mod tests {
                         default_mode: None,
                         default_config_options: HashMap::default(),
                         favorite_config_option_values: HashMap::default(),
+                        session_meta: None,
                     }
                     .into(),
                 )])),
@@ -6088,12 +6126,15 @@ mod tests {
         );
 
         let session_id = acp_v2::SessionId::new("session-1");
-        let new_session_request = directories.clone().into_new_session_request(Vec::new());
-        let load_session_request = directories
+        let new_session_request = directories
             .clone()
-            .into_load_session_request(session_id.clone(), Vec::new());
+            .into_new_session_request(Vec::new(), None);
+        let load_session_request =
+            directories
+                .clone()
+                .into_load_session_request(session_id.clone(), Vec::new(), None);
         let resume_session_request =
-            directories.into_resume_session_request(session_id, Vec::new());
+            directories.into_resume_session_request(session_id, Vec::new(), None);
 
         assert_eq!(
             new_session_request.cwd,
@@ -6125,10 +6166,11 @@ mod tests {
                 cwd: PathBuf::from("/workspace"),
                 additional_directories: Vec::new(),
             };
-            let load = directories
-                .clone()
-                .into_load_session_request(session_id.clone(), Vec::new());
-            let resume = directories.into_resume_session_request(session_id, Vec::new());
+            let load =
+                directories
+                    .clone()
+                    .into_load_session_request(session_id.clone(), Vec::new(), None);
+            let resume = directories.into_resume_session_request(session_id, Vec::new(), None);
 
             for wire_id in [&load.session_id, &resume.session_id] {
                 assert_eq!(wire_id.0.as_ref(), value);
@@ -6496,6 +6538,7 @@ mod tests {
                             AgentConfigOptionValue::from("config-value"),
                         )]),
                         favorite_config_option_values: HashMap::default(),
+                        session_meta: None,
                     }
                     .into(),
                 )])),
@@ -6528,6 +6571,139 @@ mod tests {
 
         assert_eq!(harness.connection.defaults.mode(), None);
         assert_eq!(harness.connection.defaults.config_option("mode"), None);
+    }
+
+    fn claude_extra_args_meta() -> acp::Meta {
+        acp::Meta::from_iter([(
+            "claudeCode".to_owned(),
+            serde_json::json!({ "options": { "extraArgs": { "chrome": "" } } }),
+        )])
+    }
+
+    fn set_test_agent_session_meta(session_meta: Option<acp::Meta>, cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            AllAgentServersSettings::override_global(
+                AllAgentServersSettings(HashMap::from_iter([(
+                    "test".to_string(),
+                    settings::CustomAgentServerSettings::Registry {
+                        env: HashMap::default(),
+                        default_mode: None,
+                        default_config_options: HashMap::default(),
+                        favorite_config_option_values: HashMap::default(),
+                        session_meta,
+                    }
+                    .into(),
+                )])),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    #[test]
+    fn session_requests_carry_session_meta() {
+        let directories = SessionDirectories {
+            cwd: PathBuf::from("/workspace"),
+            additional_directories: Vec::new(),
+        };
+        let session_id = acp_v2::SessionId::new("session-1");
+        let meta = claude_extra_args_meta();
+
+        let new_session = directories
+            .clone()
+            .into_new_session_request(Vec::new(), Some(meta.clone()));
+        let load_session = directories.clone().into_load_session_request(
+            session_id.clone(),
+            Vec::new(),
+            Some(meta.clone()),
+        );
+        let resume_session = directories.clone().into_resume_session_request(
+            session_id.clone(),
+            Vec::new(),
+            Some(meta.clone()),
+        );
+        assert_eq!(new_session.meta, Some(meta.clone()));
+        assert_eq!(load_session.meta, Some(meta.clone()));
+        assert_eq!(resume_session.meta, Some(meta));
+        assert_eq!(
+            serde_json::to_value(&new_session).expect("serialize new session")["_meta"],
+            serde_json::json!({ "claudeCode": { "options": { "extraArgs": { "chrome": "" } } } })
+        );
+
+        let new_session = directories
+            .clone()
+            .into_new_session_request(Vec::new(), None);
+        let load_session =
+            directories
+                .clone()
+                .into_load_session_request(session_id.clone(), Vec::new(), None);
+        let resume_session = directories.into_resume_session_request(session_id, Vec::new(), None);
+        assert_eq!(new_session.meta, None);
+        assert_eq!(load_session.meta, None);
+        assert_eq!(resume_session.meta, None);
+        assert!(
+            serde_json::to_value(&new_session)
+                .expect("serialize new session")
+                .get("_meta")
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    async fn configured_session_meta_is_sent_with_session_requests(cx: &mut gpui::TestAppContext) {
+        init_settings_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+        let work_dirs = PathList::new(&[std::path::Path::new("/a")]);
+
+        set_test_agent_session_meta(Some(claude_extra_args_meta()), cx);
+        cx.update(|cx| {
+            harness
+                .connection
+                .clone()
+                .new_session(project.clone(), work_dirs.clone(), cx)
+        })
+        .await
+        .expect("new session");
+        cx.update(|cx| {
+            harness.connection.clone().load_session(
+                acp_v2::SessionId::new("saved"),
+                project.clone(),
+                work_dirs.clone(),
+                None,
+                cx,
+            )
+        })
+        .await
+        .expect("load session");
+
+        set_test_agent_session_meta(None, cx);
+        cx.update(|cx| {
+            harness.connection.clone().load_session(
+                acp_v2::SessionId::new("unconfigured"),
+                project.clone(),
+                work_dirs.clone(),
+                None,
+                cx,
+            )
+        })
+        .await
+        .expect("load session without session meta");
+
+        assert_eq!(
+            *harness
+                .session_request_metas
+                .lock()
+                .expect("session request metas"),
+            vec![
+                Some(claude_extra_args_meta()),
+                Some(claude_extra_args_meta()),
+                None,
+            ]
+        );
     }
 
     #[gpui::test]
