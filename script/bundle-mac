@@ -194,6 +194,14 @@ function download_and_unpack() {
 function download_git() {
     local architecture=$1
     local target_binary=$2
+    # Local bundles reuse the downloaded binary, so a GitHub outage does not
+    # break rebuilds.
+    local cached_binary="target/${architecture}/git-${GIT_VERSION}"
+
+    if [[ -x "$cached_binary" ]]; then
+        cp "$cached_binary" "${target_binary}"
+        return
+    fi
 
     tmp_dir=$(mktemp -d)
     pushd "$tmp_dir"
@@ -215,6 +223,7 @@ function download_git() {
 
     mv "${tmp_dir}/git" "${target_binary}"
     rm -rf "$tmp_dir"
+    cp "${target_binary}" "$cached_binary"
 }
 
 function sign_app_binaries() {
