@@ -1181,7 +1181,7 @@ fn appearance_page() -> SettingsPage {
         ]
     }
 
-    fn agent_panel_font_section() -> [SettingsPageItem; 5] {
+    fn agent_panel_font_section() -> [SettingsPageItem; 6] {
         [
             SettingsPageItem::SectionHeader("Agent Panel Font"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -1219,6 +1219,20 @@ fn appearance_page() -> SettingsPage {
                     },
                     write: |settings_content, value, _| {
                         settings_content.theme.agent_ui_font_size = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "UI Line Height",
+                description: "Line height of agent responses in the agent panel, as a multiple of their font size. Leave empty for the built-in spacing.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent_ui_line_height"),
+                    pick: |settings_content| settings_content.theme.agent_ui_line_height.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.theme.agent_ui_line_height = value;
                     },
                 }),
                 metadata: None,

@@ -57,6 +57,8 @@ pub struct ThemeSettings {
     agent_ui_font_family: Option<SharedString>,
     /// The agent font size. Determines the size of text in the agent panel. Falls back to the UI font size if unset.
     agent_ui_font_size: Option<Pixels>,
+    /// Line height of agent responses as a multiple of their font size.
+    agent_ui_line_height: Option<f32>,
     /// The agent buffer font family. Determines the family of user messages in the agent panel.
     /// Falls back to the buffer font family if unset.
     agent_buffer_font_family: Option<SharedString>,
@@ -400,6 +402,10 @@ impl ThemeSettings {
             .or(self.agent_ui_font_size)
             .map(clamp_font_size)
             .unwrap_or_else(|| self.ui_font_size(cx))
+    }
+
+    pub fn agent_ui_line_height(&self) -> Option<f32> {
+        self.agent_ui_line_height
     }
 
     pub fn agent_ui_font_family(&self) -> &SharedString {
@@ -756,6 +762,9 @@ impl settings::Settings for ThemeSettings {
                 .as_ref()
                 .map(|font| font.0.clone().into()),
             agent_ui_font_size: content.agent_ui_font_size.map(|s| s.into_gpui()),
+            agent_ui_line_height: content
+                .agent_ui_line_height
+                .map(|line_height| line_height.max(1.0)),
             agent_buffer_font_family: content
                 .agent_buffer_font_family
                 .as_ref()

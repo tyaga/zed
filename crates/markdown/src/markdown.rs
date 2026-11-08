@@ -223,7 +223,10 @@ impl MarkdownStyle {
         };
 
         let mut text_style = window.text_style();
-        let line_height = buffer_font_size * 1.75;
+        let line_height: DefiniteLength = match (font, theme_settings.agent_ui_line_height()) {
+            (MarkdownFont::Agent, Some(line_height)) => relative(line_height),
+            _ => (buffer_font_size * 1.75).into(),
+        };
 
         text_style.refine(&TextStyleRefinement {
             font_family: Some(body_font_family),
@@ -234,7 +237,7 @@ impl MarkdownStyle {
             } else {
                 ui_font_size.into()
             }),
-            line_height: Some(line_height.into()),
+            line_height: Some(line_height),
             color: Some(colors.text),
             ..Default::default()
         });
@@ -5636,6 +5639,36 @@ mod tests {
                 cx
             )),
             Some(clipped_character_index),
+        );
+    }
+
+    #[gpui::test]
+    fn test_agent_ui_line_height_setting(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let cx = cx.add_empty_window();
+        let line_height = |font: MarkdownFont, cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                MarkdownStyle::themed(font, window, cx)
+                    .base_text_style
+                    .line_height
+            })
+        };
+        let default_agent_line_height = line_height(MarkdownFont::Agent, cx);
+        let default_editor_line_height = line_height(MarkdownFont::Editor, cx);
+
+        cx.update(|_window, cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.theme.agent_ui_line_height = Some(1.2);
+                });
+            });
+        });
+
+        assert_ne!(default_agent_line_height, relative(1.2));
+        assert_eq!(line_height(MarkdownFont::Agent, cx), relative(1.2));
+        assert_eq!(
+            line_height(MarkdownFont::Editor, cx),
+            default_editor_line_height
         );
     }
 

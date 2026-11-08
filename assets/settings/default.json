@@ -73,6 +73,9 @@
   "agent_ui_font_family": null,
   // The default font size for agent responses in the agent panel. Falls back to the UI font size if unset.
   "agent_ui_font_size": null,
+  // Line height of agent responses in the agent panel, as a multiple of their font size.
+  // Values below 1.0 are raised to 1.0. Unset keeps the built-in spacing.
+  "agent_ui_line_height": null,
   // The font family for user messages in the agent panel. Falls back to the buffer font family if unset.
   "agent_buffer_font_family": null,
   // The default font size for user messages in the agent panel.

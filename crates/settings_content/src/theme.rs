@@ -209,6 +209,9 @@ pub struct ThemeSettingsContent {
     pub agent_ui_font_family: Option<FontFamilyName>,
     /// The font size for agent responses in the agent panel. Falls back to the UI font size if unset.
     pub agent_ui_font_size: Option<FontSize>,
+    /// Line height of agent responses in the agent panel, as a multiple of their font size.
+    /// Values below 1.0 are raised to 1.0. Unset keeps the built-in spacing.
+    pub agent_ui_line_height: Option<f32>,
     /// The name of a font to use for user messages in the agent panel. Falls back to the buffer font if unset.
     pub agent_buffer_font_family: Option<FontFamilyName>,
     /// The font size for user messages in the agent panel.

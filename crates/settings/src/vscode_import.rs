@@ -1036,6 +1036,7 @@ impl VsCodeSettings {
             buffer_font_features: None,
             agent_ui_font_family: None,
             agent_ui_font_size: None,
+            agent_ui_line_height: None,
             agent_buffer_font_family: None,
             agent_buffer_font_size: None,
             git_commit_buffer_font_size: None,
