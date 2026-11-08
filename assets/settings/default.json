@@ -1173,6 +1173,14 @@
     //
     // Default: false
     "hide_merge_commits": false,
+    // Whether to show short commit hashes in the History tab.
+    //
+    // Default: true
+    "show_commit_hashes": true,
+    // Whether to show commits authored with the repository's `user.email` in bold in the History tab.
+    //
+    // Default: false
+    "highlight_my_commits": false,
     // Default action when clicking a changed file in the Git panel.
     //
     // Choices: project_diff, file_diff, view_file

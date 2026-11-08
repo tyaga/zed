@@ -132,13 +132,80 @@ struct HistoryColumns {
 }
 
 impl HistoryColumns {
-    fn for_list_width(width_in_rems: f32) -> Self {
+    fn for_list_width(width_in_rems: f32, show_commit_hashes: bool) -> Self {
         Self {
             author: width_in_rems >= 31.5,
             date: width_in_rems >= 18.5,
-            sha: width_in_rems >= 13.,
+            sha: show_commit_hashes && width_in_rems >= 13.,
         }
     }
+}
+
+fn is_own_commit(author_email: &str, user_email: &str) -> bool {
+    !author_email.is_empty() && author_email.eq_ignore_ascii_case(user_email)
+}
+
+#[derive(Clone, Copy)]
+struct HistoryViewOptions {
+    hide_merge_commits: bool,
+    show_commit_hashes: bool,
+    highlight_my_commits: bool,
+}
+
+fn history_view_options_menu(
+    fs: Arc<dyn Fs>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    let settings = GitPanelSettings::get_global(cx);
+    let options = Rc::new(Cell::new(HistoryViewOptions {
+        hide_merge_commits: settings.hide_merge_commits,
+        show_commit_hashes: settings.show_commit_hashes,
+        highlight_my_commits: settings.highlight_my_commits,
+    }));
+
+    ContextMenu::build_persistent(window, cx, move |context_menu, _, _| {
+        let current = options.get();
+        let entry =
+            |label: &'static str,
+             checked: bool,
+             update_options: fn(&mut HistoryViewOptions, bool),
+             write_setting: fn(&mut settings::GitPanelSettingsContent, bool)| {
+                let options = options.clone();
+                let fs = fs.clone();
+                ContextMenuEntry::new(label)
+                    .toggle(IconPosition::End, checked)
+                    .handler(move |_, cx| {
+                        let mut updated = options.get();
+                        update_options(&mut updated, !checked);
+                        options.set(updated);
+                        update_settings_file(fs.clone(), cx, move |settings, _| {
+                            write_setting(settings.git_panel.get_or_insert_default(), !checked);
+                        });
+                    })
+            };
+
+        context_menu
+            .header("History")
+            .item(entry(
+                "Hide Merge Commits",
+                current.hide_merge_commits,
+                |options, value| options.hide_merge_commits = value,
+                |settings, value| settings.hide_merge_commits = Some(value),
+            ))
+            .item(entry(
+                "Show Commit Hashes",
+                current.show_commit_hashes,
+                |options, value| options.show_commit_hashes = value,
+                |settings, value| settings.show_commit_hashes = Some(value),
+            ))
+            .item(entry(
+                "Highlight My Commits",
+                current.highlight_my_commits,
+                |options, value| options.highlight_my_commits = value,
+                |settings, value| settings.highlight_my_commits = Some(value),
+            ))
+    })
 }
 
 fn history_entry_description(
@@ -1381,6 +1448,9 @@ pub struct GitPanel {
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history: CommitHistory,
     visible_commit_history: Rc<[CommitHistoryEntry]>,
+    /// `user.email` of the active repository, used to highlight the user's commits.
+    user_email: Option<SharedString>,
+    _user_email_task: Task<()>,
     focused_history_entry: Option<usize>,
     active_history_sha: Option<Oid>,
     history_keyboard_nav: bool,
@@ -1793,6 +1863,8 @@ impl GitPanel {
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history: CommitHistory::Loading,
                 visible_commit_history: Rc::from([]),
+                user_email: None,
+                _user_email_task: Task::ready(()),
                 focused_history_entry: None,
                 active_history_sha: None,
                 history_keyboard_nav: false,
@@ -1810,6 +1882,7 @@ impl GitPanel {
                 change_entry_indices: HashMap::default(),
             };
 
+            this.load_user_email(cx);
             this.schedule_update(window, cx);
             this
         })
@@ -5889,6 +5962,7 @@ impl GitPanel {
         }
         self.active_repository = new_active_repository;
         if active_repository_changed {
+            self.load_user_email(cx);
             self.update_active_history_sha(cx);
             self.reset_branch_state(window, cx);
         }
@@ -6037,6 +6111,7 @@ impl GitPanel {
         let active_repository = self.project.read(cx).active_repository(cx);
         if active_repository != self.active_repository {
             self.active_repository = active_repository;
+            self.load_user_email(cx);
             self.git_access = None;
             self.clear_marks();
             self.reset_branch_state(window, cx);
@@ -8062,20 +8137,23 @@ impl GitPanel {
     }
 
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let hide_merge_commits = GitPanelSettings::get_global(cx).hide_merge_commits;
+        let fs = self.fs.clone();
         v_flex()
             .flex_1()
             .size_full()
             .overflow_hidden()
             .child(
-                h_flex().px_2().py_1().child(
-                    Checkbox::new("hide-merge-commits", hide_merge_commits.into())
-                        .label("Hide merge commits")
-                        .label_size(LabelSize::Small)
-                        .label_color(Color::Muted)
-                        .on_click(cx.listener(|this, state: &ToggleState, _, cx| {
-                            this.set_hide_merge_commits(state.selected(), cx);
-                        })),
+                h_flex().px_2().py_0p5().justify_end().child(
+                    PopoverMenu::new("history-view-options")
+                        .trigger_with_tooltip(
+                            IconButton::new("history-view-options-trigger", IconName::Eye)
+                                .icon_size(IconSize::Small),
+                            Tooltip::text("History View Options"),
+                        )
+                        .menu(move |window, cx| {
+                            Some(history_view_options_menu(fs.clone(), window, cx))
+                        })
+                        .anchor(Anchor::TopRight),
                 ),
             )
             .map(|this| {
@@ -8114,18 +8192,30 @@ impl GitPanel {
         &self.visible_commit_history
     }
 
-    fn set_hide_merge_commits(&mut self, hide: bool, cx: &mut Context<Self>) {
-        if let Some(workspace) = self.workspace.upgrade() {
-            let fs = workspace.read(cx).app_state().fs.clone();
-            cx.update_global::<SettingsStore, _>(|store, _cx| {
-                store.update_settings_file(fs, move |settings, _cx| {
-                    settings
-                        .git_panel
-                        .get_or_insert_default()
-                        .hide_merge_commits = Some(hide);
-                });
-            });
-        }
+    fn load_user_email(&mut self, cx: &mut Context<Self>) {
+        self.user_email = None;
+        let Some(repository) = self.active_repository.as_ref() else {
+            self._user_email_task = Task::ready(());
+            return;
+        };
+        let work_directory = repository.read(cx).work_directory_abs_path.clone();
+        let user_email = self.project.read(cx).git_config(
+            work_directory,
+            vec!["--get".to_string(), "user.email".to_string()],
+            cx,
+        );
+        self._user_email_task = cx.spawn(async move |this, cx| {
+            // `git config --get` fails when the email is not configured; nothing is highlighted then.
+            let Ok(user_email) = user_email.await else {
+                return;
+            };
+            let user_email = user_email.trim().to_string();
+            this.update(cx, |this, cx| {
+                this.user_email = (!user_email.is_empty()).then(|| user_email.into());
+                cx.notify();
+            })
+            .ok();
+        });
     }
 
     fn refresh_visible_commit_history(&mut self, keep_focused_commit: bool, cx: &App) {
@@ -8449,6 +8539,11 @@ impl GitPanel {
             .as_ref()
             .and_then(|context_menu| context_menu.target_entry_index);
 
+        let own_email = GitPanelSettings::get_global(cx)
+            .highlight_my_commits
+            .then(|| self.user_email.clone())
+            .flatten();
+
         let ahead_count = active_repository
             .read(cx)
             .branch
@@ -8470,12 +8565,15 @@ impl GitPanel {
                         let git_panel = cx.weak_entity();
                         let scroll_handle = commit_history_scroll_handle.clone();
                         move |range, window, cx| {
-                            let date_style = GitPanelSettings::get_global(cx).date_style;
+                            let settings = GitPanelSettings::get_global(cx);
+                            let date_style = settings.date_style;
+                            let show_commit_hashes = settings.show_commit_hashes;
                             let list_width =
                                 scroll_handle.0.borrow().base_handle.bounds().size.width;
-                            let columns = HistoryColumns::for_list_width(f32::from(
-                                list_width / window.rem_size(),
-                            ));
+                            let columns = HistoryColumns::for_list_width(
+                                f32::from(list_width / window.rem_size()),
+                                show_commit_hashes,
+                            );
                             let visible_data: Vec<Option<Arc<CommitData>>> = repo_weak
                                 .update(cx, |repository, cx| {
                                     entries[range.clone()]
@@ -8517,6 +8615,12 @@ impl GitPanel {
                                         ),
                                         None => ("Loading…".into(), "".into(), None, None),
                                     };
+
+                                    let is_own = own_email.as_ref().is_some_and(|own_email| {
+                                        author_email.as_ref().is_some_and(|author_email| {
+                                            is_own_commit(author_email, own_email)
+                                        })
+                                    });
 
                                     let formatted_time: SharedString = timestamp
                                         .and_then(|ts| {
@@ -8584,6 +8688,9 @@ impl GitPanel {
                                                 .child(
                                                     Label::new(subject)
                                                         .size(LabelSize::Small)
+                                                        .when(is_own, |label| {
+                                                            label.weight(gpui::FontWeight::SEMIBOLD)
+                                                        })
                                                         .truncate(),
                                                 )
                                                 .children((!tag_names.is_empty()).then(|| {
@@ -10977,22 +11084,44 @@ mod tests {
     }
 
     #[test]
+    fn test_history_columns_hide_sha_when_hashes_are_off() {
+        assert_eq!(
+            HistoryColumns::for_list_width(40., false),
+            HistoryColumns {
+                author: true,
+                date: true,
+                sha: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_is_own_commit() {
+        assert!(is_own_commit(
+            "Jane.Doe@Example.com",
+            "jane.doe@example.com"
+        ));
+        assert!(!is_own_commit("john@example.com", "jane.doe@example.com"));
+        assert!(!is_own_commit("", ""));
+    }
+
+    #[test]
     fn test_history_columns_drop_author_then_date_then_sha() {
         let columns = |author, date, sha| HistoryColumns { author, date, sha };
         assert_eq!(
-            HistoryColumns::for_list_width(40.),
+            HistoryColumns::for_list_width(40., true),
             columns(true, true, true)
         );
         assert_eq!(
-            HistoryColumns::for_list_width(22.),
+            HistoryColumns::for_list_width(22., true),
             columns(false, true, true)
         );
         assert_eq!(
-            HistoryColumns::for_list_width(15.),
+            HistoryColumns::for_list_width(15., true),
             columns(false, false, true)
         );
         assert_eq!(
-            HistoryColumns::for_list_width(10.),
+            HistoryColumns::for_list_width(10., true),
             columns(false, false, false)
         );
     }

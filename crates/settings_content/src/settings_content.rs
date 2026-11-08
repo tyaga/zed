@@ -833,6 +833,16 @@ pub struct GitPanelSettingsContent {
     /// Default: false
     pub hide_merge_commits: Option<bool>,
 
+    /// Whether to show short commit hashes in the History tab.
+    ///
+    /// Default: true
+    pub show_commit_hashes: Option<bool>,
+
+    /// Whether to show commits authored with the repository's `user.email` in bold in the History tab.
+    ///
+    /// Default: false
+    pub highlight_my_commits: Option<bool>,
+
     /// Default action when clicking a changed file in the Git panel.
     ///
     /// Default: project_diff

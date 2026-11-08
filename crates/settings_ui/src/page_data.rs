@@ -6582,7 +6582,7 @@ fn panels_page() -> SettingsPage {
         ]
     }
 
-    fn git_panel_section() -> [SettingsPageItem; 22] {
+    fn git_panel_section() -> [SettingsPageItem; 24] {
         [
             SettingsPageItem::SectionHeader("Git Panel"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -6941,6 +6941,52 @@ fn panels_page() -> SettingsPage {
                             .git_panel
                             .get_or_insert_default()
                             .hide_merge_commits = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Show Commit Hashes",
+                description: "Whether to show short commit hashes in the History tab.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("git_panel.show_commit_hashes"),
+                    pick: |settings_content| {
+                        settings_content
+                            .git_panel
+                            .as_ref()?
+                            .show_commit_hashes
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .git_panel
+                            .get_or_insert_default()
+                            .show_commit_hashes = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Highlight My Commits",
+                description: "Whether to show commits authored with the repository's user.email in bold in the History tab.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("git_panel.highlight_my_commits"),
+                    pick: |settings_content| {
+                        settings_content
+                            .git_panel
+                            .as_ref()?
+                            .highlight_my_commits
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .git_panel
+                            .get_or_insert_default()
+                            .highlight_my_commits = value;
                     },
                 }),
                 metadata: None,
