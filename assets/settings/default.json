@@ -1089,11 +1089,11 @@
     "default_width": 240,
   },
   "git_graph": {
-    // Show "absolute" or "relative" dates in graph rows.
+    // Show "absolute", "relative" or "compact" dates in graph rows.
     "date_style": "absolute",
   },
   "git_panel": {
-    // Show "relative" or "absolute" dates in commit history.
+    // Show "relative", "absolute" or "compact" dates in commit history.
     "date_style": "relative",
     // Whether to show the git panel button in the status bar.
     "button": true,
@@ -1886,7 +1886,7 @@
     // Control whether the git blame information is shown for the currently
     // focused line, and where it is rendered.
     "inline_blame": {
-      // Show "relative" or "absolute" dates inline and in the status bar.
+      // Show "relative", "absolute" or "compact" dates inline and in the status bar.
       "date_style": "relative",
       "enabled": true,
       // Sets a delay after which the inline blame information is shown.
@@ -1903,19 +1903,19 @@
       "min_column": 0,
     },
     "blame": {
-      // Show "relative" or "absolute" dates in the blame gutter.
+      // Show "relative", "absolute" or "compact" dates in the blame gutter.
       "date_style": "relative",
       "show_avatar": true,
     },
     // Control which information is shown in the branch picker.
     "branch_picker": {
-      // Show "relative" or "absolute" dates in the branch picker.
+      // Show "relative", "absolute" or "compact" dates in the branch picker.
       "date_style": "relative",
       "show_author_name": true,
     },
     // Control which information is shown in the stash picker.
     "stash_picker": {
-      // Show "relative" or "absolute" dates in the stash picker.
+      // Show "relative", "absolute" or "compact" dates in the stash picker.
       "date_style": "relative",
     },
     "commit_view": {

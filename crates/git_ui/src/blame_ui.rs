@@ -149,9 +149,12 @@ impl BlameRenderer for GitBlameRenderer {
     }
 
     fn max_timestamp_width(&self, cx: &App) -> usize {
-        if ProjectSettings::get_global(cx).git.blame.date_style == settings::GitDateStyle::Relative
-        {
-            return editor::MAX_RELATIVE_TIMESTAMP.len();
+        match ProjectSettings::get_global(cx).git.blame.date_style {
+            settings::GitDateStyle::Relative => return editor::MAX_RELATIVE_TIMESTAMP.len(),
+            settings::GitDateStyle::Compact => {
+                return crate::git_timestamp::MAX_COMPACT_DATE_WIDTH;
+            }
+            settings::GitDateStyle::Absolute => {}
         }
         crate::git_timestamp::longest_git_dates(cx)
             .iter()

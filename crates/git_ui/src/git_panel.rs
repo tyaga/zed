@@ -134,8 +134,8 @@ struct HistoryColumns {
 impl HistoryColumns {
     fn for_list_width(width_in_rems: f32) -> Self {
         Self {
-            author: width_in_rems >= 30.,
-            date: width_in_rems >= 17.,
+            author: width_in_rems >= 31.5,
+            date: width_in_rems >= 18.5,
             sha: width_in_rems >= 13.,
         }
     }
@@ -8675,7 +8675,7 @@ impl GitPanel {
                                         )
                                         .when(columns.date, |this| {
                                             this.child(
-                                                div().w(rems(6.)).flex_none().min_w_0().child(
+                                                div().w(rems(7.5)).flex_none().min_w_0().child(
                                                     Label::new(formatted_time.clone())
                                                         .size(LabelSize::Small)
                                                         .color(Color::Muted)

@@ -870,6 +870,8 @@ pub enum GitDateStyle {
     #[default]
     Relative,
     Absolute,
+    /// "Today 14:05", "Yesterday 09:30", "18-09 14:05" this year, "18-09-2024 14:05" earlier.
+    Compact,
 }
 
 #[with_fallible_options]

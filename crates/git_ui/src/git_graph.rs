@@ -638,8 +638,14 @@ fn format_timestamp(timestamp: i64, date_style: GitDateStyle, cx: &App) -> Strin
         return "Unknown".to_string();
     };
 
-    if date_style == GitDateStyle::Relative {
-        return format_git_timestamp(datetime, time_format::TimestampFormat::Relative, cx);
+    match date_style {
+        GitDateStyle::Relative => {
+            return format_git_timestamp(datetime, time_format::TimestampFormat::Relative, cx);
+        }
+        GitDateStyle::Compact => {
+            return crate::git_timestamp::format_git_date(datetime, date_style, cx);
+        }
+        GitDateStyle::Absolute => {}
     }
     let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
     let local_datetime = datetime.to_offset(local_offset);

@@ -18,12 +18,47 @@ pub(crate) fn format_git_timestamp(
     )
 }
 
+/// Width of the widest compact date, "DD-MM-YYYY HH:MM".
+pub(crate) const MAX_COMPACT_DATE_WIDTH: usize = 16;
+
 pub(crate) fn format_git_date(timestamp: OffsetDateTime, style: GitDateStyle, cx: &App) -> String {
     let format = match style {
         GitDateStyle::Relative => TimestampFormat::Relative,
         GitDateStyle::Absolute => TimestampFormat::EnhancedAbsolute,
+        GitDateStyle::Compact => {
+            return format_compact_timestamp(
+                timestamp,
+                OffsetDateTime::now_utc(),
+                UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC),
+            );
+        }
     };
     format_git_timestamp(timestamp, format, cx)
+}
+
+fn format_compact_timestamp(
+    timestamp: OffsetDateTime,
+    reference: OffsetDateTime,
+    offset: UtcOffset,
+) -> String {
+    let timestamp = timestamp.to_offset(offset);
+    let today = reference.to_offset(offset).date();
+    let date = timestamp.date();
+    let time = format!("{:02}:{:02}", timestamp.hour(), timestamp.minute());
+    if date == today {
+        format!("Today {time}")
+    } else if today.previous_day() == Some(date) {
+        format!("Yesterday {time}")
+    } else if date.year() == today.year() {
+        format!("{:02}-{:02} {time}", date.day(), u8::from(date.month()))
+    } else {
+        format!(
+            "{:02}-{:02}-{} {time}",
+            date.day(),
+            u8::from(date.month()),
+            date.year()
+        )
+    }
 }
 
 pub(crate) fn longest_git_dates(cx: &App) -> [String; 3] {
@@ -75,6 +110,46 @@ mod tests {
     use settings::SettingsStore;
     use time::macros::{datetime, offset};
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn compact_dates() {
+        let reference = datetime!(2024-06-08 12:00:00 UTC);
+        for (timestamp, expected) in [
+            (datetime!(2024-06-08 09:05:00 UTC), "Today 09:05"),
+            (datetime!(2024-06-07 23:59:00 UTC), "Yesterday 23:59"),
+            (datetime!(2024-06-06 08:00:00 UTC), "06-06 08:00"),
+            (datetime!(2024-01-01 00:00:00 UTC), "01-01 00:00"),
+            (datetime!(2023-12-31 18:30:00 UTC), "31-12-2023 18:30"),
+        ] {
+            assert_eq!(
+                format_compact_timestamp(timestamp, reference, UtcOffset::UTC),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn compact_dates_use_local_calendar_days() {
+        // 22:30 UTC on June 7 is 07:30 on June 8 at +9, the same local day as the reference.
+        let reference = datetime!(2024-06-08 03:00:00 UTC);
+        assert_eq!(
+            format_compact_timestamp(datetime!(2024-06-07 22:30:00 UTC), reference, offset!(+9)),
+            "Today 07:30"
+        );
+        assert_eq!(
+            format_compact_timestamp(datetime!(2024-06-07 10:00:00 UTC), reference, offset!(+9)),
+            "Yesterday 19:00"
+        );
+        // A new year starts earlier at +9 than in UTC.
+        assert_eq!(
+            format_compact_timestamp(
+                datetime!(2023-12-31 16:00:00 UTC),
+                datetime!(2024-03-01 00:00:00 UTC),
+                offset!(+9)
+            ),
+            "01-01 01:00"
+        );
+    }
 
     #[test]
     fn absolute_formats_use_local_time() {
