@@ -8581,7 +8581,11 @@ impl GitPanel {
                                                 .gap_1()
                                                 .flex_1()
                                                 .min_w_0()
-                                                .child(Label::new(subject).truncate())
+                                                .child(
+                                                    Label::new(subject)
+                                                        .size(LabelSize::Small)
+                                                        .truncate(),
+                                                )
                                                 .children((!tag_names.is_empty()).then(|| {
                                                     let hidden_tag_count = tag_names
                                                         .len()
