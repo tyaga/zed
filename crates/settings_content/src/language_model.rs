@@ -13,6 +13,7 @@ pub struct AllLanguageModelSettingsContent {
     pub anthropic: Option<AnthropicSettingsContent>,
     pub anthropic_compatible: Option<HashMap<Arc<str>, AnthropicCompatibleSettingsContent>>,
     pub bedrock: Option<AmazonBedrockSettingsContent>,
+    pub claude_code: Option<ClaudeCodeSettingsContent>,
     pub deepseek: Option<DeepseekSettingsContent>,
     pub google: Option<GoogleSettingsContent>,
     #[serde(rename = "llama.cpp")]
@@ -199,6 +200,14 @@ pub enum BedrockAuthMethodContent {
     /// IMDSv2, PodIdentity, env vars, etc.
     #[serde(rename = "default")]
     Automatic,
+}
+
+#[with_fallible_options]
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
+pub struct ClaudeCodeSettingsContent {
+    /// Path to the `claude` executable. When unset, `claude` is looked up on `PATH` and in the
+    /// default install locations.
+    pub path: Option<String>,
 }
 
 #[with_fallible_options]

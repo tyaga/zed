@@ -2757,6 +2757,11 @@
     "google": {
       "api_url": "https://generativelanguage.googleapis.com",
     },
+    "claude_code": {
+      // Path to the `claude` executable. When null, it is looked up on PATH and in
+      // ~/.local/bin and ~/.claude/local.
+      "path": null,
+    },
     "ollama": {
       "api_url": "http://localhost:11434",
     },
