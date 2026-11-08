@@ -117,6 +117,7 @@ use zed_actions::{
 const GIT_PANEL_KEY: &str = "GitPanel";
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 const RECENT_COMMIT_COUNT: usize = 3;
+const MAX_SHORT_SHA_LEN: usize = 7;
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
 const TREE_INDENT: f32 = 16.0;
 const MAX_HISTORY_TAG_CHIPS: usize = 3;
@@ -1704,9 +1705,7 @@ impl GitPanel {
                         this.git_access = None;
                         this.schedule_update(window, cx);
                     }
-                    GitStoreEvent::ParkedRepositoriesChanged => {
-                        this.schedule_update(window, cx);
-                    }
+                    GitStoreEvent::ParkedRepositoriesChanged => cx.notify(),
                     GitStoreEvent::IndexWriteError(error) => {
                         this.workspace
                             .update(cx, |workspace, cx| {
@@ -7215,7 +7214,11 @@ impl GitPanel {
 
     fn render_repository_tree(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let rows = self.repository_tree_rows(cx);
-        if rows.len() <= 1 {
+        let only_loaded_repository = matches!(
+            rows.as_slice(),
+            [row] if matches!(row.source, RepositoryTreeSource::Loaded(_))
+        );
+        if rows.is_empty() || only_loaded_repository {
             return None;
         }
         let collapsed = self.repository_tree_collapsed;
@@ -7273,7 +7276,6 @@ impl GitPanel {
         is_active: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        const MAX_SHORT_SHA_LEN: usize = 7;
         let repository = match row.source {
             RepositoryTreeSource::Loaded(id) => self
                 .project
@@ -10650,11 +10652,6 @@ impl PanelRepoFooter {
 
 impl RenderOnce for PanelRepoFooter {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let project = self
-            .git_panel
-            .as_ref()
-            .map(|panel| panel.read(cx).project.clone());
-
         let (workspace, repo) = self
             .git_panel
             .as_ref()
@@ -10664,12 +10661,6 @@ impl RenderOnce for PanelRepoFooter {
             })
             .unzip();
 
-        let single_repo = project
-            .as_ref()
-            .map(|project| project.read(cx).git_store().read(cx).repositories().len() == 1)
-            .unwrap_or(true);
-
-        const MAX_SHORT_SHA_LEN: usize = 8;
         let branch_name = self
             .branch
             .as_ref()
@@ -10720,13 +10711,11 @@ impl RenderOnce for PanelRepoFooter {
                     .flex_1()
                     .overflow_hidden()
                     .gap_px()
-                    .child(Icon::new(IconName::GitBranch).size(IconSize::Small).color(
-                        if single_repo {
-                            Color::Disabled
-                        } else {
-                            Color::Muted
-                        },
-                    ))
+                    .child(
+                        Icon::new(IconName::GitBranch)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
                     .child(div().child(branch_selector).min_w_0()),
             )
             .children(if let Some(git_panel) = self.git_panel {
@@ -19157,6 +19146,37 @@ mod tests {
             |_, _| panel.clone().into_any_element(),
         );
         assert!(cx.debug_bounds("repository-tree").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_repository_tree_shown_for_single_parked_repository(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({ "nested": { "deep": { "three": { ".git": {}, "c.txt": "" } } } }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let panel = workspace.update_in(cx, GitPanel::new);
+        cx.run_until_parked();
+
+        let rows = panel.read_with(cx, |panel, cx| panel.repository_tree_rows(cx));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, RepositoryTreeSource::Parked);
+
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(400.), px(800.)),
+            |_, _| panel.clone().into_any_element(),
+        );
+        assert!(cx.debug_bounds("repository-tree").is_some());
     }
 
     #[gpui::test]

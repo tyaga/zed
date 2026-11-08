@@ -37,9 +37,9 @@ merge commits.
   not loaded) are listed too, in muted text and without branch information.
   Clicking one activates it in the git store and then makes it the active
   repository.
-- The tree is hidden when the project has at most one repository, counting
-  parked ones. Otherwise it takes at most a third of the panel height and
-  scrolls beyond that. Its header row ("Repositories" and the count) has a
+- The tree is hidden when its only row is a loaded repository. A single
+  parked repository still shows the tree, so that it can be activated. The
+  tree takes at most a third of the panel height and scrolls beyond that. Its header row ("Repositories" and the count) has a
   disclosure arrow that collapses the tree; the collapsed state is stored with
   the panel's serialized state.
 - The repository dropdown in the panel footer is removed. The branch button
