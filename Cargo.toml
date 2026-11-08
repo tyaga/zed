@@ -90,6 +90,7 @@ members = [
     "crates/git",
     "crates/git_hosting_providers",
     "crates/git_ui",
+    "crates/gitlab",
     "crates/git_ui_core",
     "crates/github_releases",
     "crates/go_to_line",
@@ -366,6 +367,7 @@ fuzzy_nucleo = { path = "crates/fuzzy_nucleo" }
 git = { path = "crates/git" }
 git_hosting_providers = { path = "crates/git_hosting_providers" }
 git_ui = { path = "crates/git_ui" }
+gitlab = { path = "crates/gitlab" }
 git_ui_core = { path = "crates/git_ui_core" }
 github_releases = { path = "crates/github_releases" }
 go_to_line = { path = "crates/go_to_line" }
@@ -906,6 +908,7 @@ serde_path_to_error = "0.1.17"
 serde_urlencoded = "0.7"
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 serde_yaml_ng = "0.10"
+sha1 = "0.10"
 sha2 = "0.10"
 shellexpand = "3.1"
 shlex = "2.0"

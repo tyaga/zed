@@ -7171,6 +7171,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "gitlab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "editor",
+ "fs",
+ "futures 0.3.34",
+ "git",
+ "git_hosting_providers",
+ "git_ui",
+ "gpui",
+ "http_client",
+ "language",
+ "log",
+ "pretty_assertions",
+ "project",
+ "remote_connection",
+ "serde",
+ "serde_json",
+ "settings",
+ "sha1",
+ "ui",
+ "url",
+ "urlencoding",
+ "util",
+ "workspace",
+ "zlog",
+]
+
+[[package]]
 name = "gl_generator"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22560,6 +22591,7 @@ dependencies = [
  "git_hosting_providers",
  "git_ui",
  "git_ui_core",
+ "gitlab",
  "go_to_line",
  "gpui",
  "gpui_platform",
