@@ -4486,6 +4486,72 @@ async fn test_repository_above_root(executor: BackgroundExecutor, cx: &mut TestA
 }
 
 #[gpui::test]
+async fn test_repositories_in_ignored_directories_are_discovered(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor);
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            ".git": {},
+            ".gitignore": "sources-*\ndeps\n",
+            "sources-infra": {
+                "alpha": { ".git": {}, "a.txt": "A" },
+                "beta": { ".git": {} },
+                "notes": { "n.txt": "N" },
+            },
+            "deps": {
+                "a": { "b": { "c": { ".git": {} } } },
+            },
+        }),
+    )
+    .await;
+    let worktree = Worktree::local(
+        path!("/root").as_ref(),
+        true,
+        fs.clone(),
+        Arc::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    worktree
+        .update(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    cx.run_until_parked();
+
+    let mut repos = worktree.update(cx, |worktree, _| {
+        worktree.as_local().unwrap().repositories()
+    });
+    repos.sort();
+    pretty_assertions::assert_eq!(
+        repos,
+        [
+            Path::new(path!("/root")).into(),
+            Path::new(path!("/root/sources-infra/alpha")).into(),
+            Path::new(path!("/root/sources-infra/beta")).into(),
+        ]
+    );
+
+    worktree.read_with(cx, |worktree, _| {
+        let kind = |path: &str| {
+            worktree
+                .entry_for_path(rel_path(path))
+                .map(|entry| entry.kind)
+        };
+        assert_eq!(kind("sources-infra/notes"), Some(EntryKind::UnloadedDir));
+        assert_eq!(kind("deps"), Some(EntryKind::UnloadedDir));
+    });
+}
+
+#[gpui::test]
 async fn test_global_gitignore(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx);
 

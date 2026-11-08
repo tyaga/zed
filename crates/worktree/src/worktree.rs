@@ -89,6 +89,10 @@ pub const FS_WATCH_LATENCY: Duration = Duration::from_millis(100);
 /// the watcher silently attached to a path that no longer exists.
 pub const ROOT_PATH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How many directory levels below an ignored directory are searched for git repositories.
+/// Ignored directories are often large dependency or build trees, so the search stays shallow.
+const IGNORED_REPOSITORY_SEARCH_DEPTH: usize = 2;
+
 /// A set of local or remote files that are being opened as part of a project.
 /// Responsible for tracking related FS (for local)/collab (for remote) events and corresponding updates.
 /// Stores git repositories data and the diagnostics for the file(s).
@@ -4525,6 +4529,9 @@ impl BackgroundScanner {
         // Perform an initial scan of the directory.
         drop(scan_job_tx);
         self.scan_dirs(true, scan_job_rx).await;
+        if scanning_enabled && self.track_git_repositories {
+            self.load_repositories_in_ignored_directories().await;
+        }
         {
             let mut state = self.state.lock().await;
             state.snapshot.completed_scan_id = state.snapshot.scan_id;
@@ -5253,6 +5260,122 @@ impl BackgroundScanner {
         .await;
         self.scan_dirs(false, scan_job_rx).await;
         self.send_status_update(false, SmallVec::new(), &[]).await;
+    }
+
+    /// Ignored directories stay unloaded, so a repository inside one would only be found once
+    /// the user opens it. Load just the directories leading to such repositories so they are
+    /// discovered with the rest of the worktree.
+    async fn load_repositories_in_ignored_directories(&self) {
+        let (root_abs_path, ignored_dirs) = {
+            let state = self.state.lock().await;
+            let ignored_dirs = state
+                .snapshot
+                .entries(true, 0)
+                .filter(|entry| {
+                    entry.kind == EntryKind::UnloadedDir && entry.is_ignored && !entry.is_external
+                })
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>();
+            (state.snapshot.abs_path.clone(), ignored_dirs)
+        };
+
+        let mut found = Vec::new();
+        for ignored_dir in ignored_dirs {
+            let dot_git_paths = self
+                .find_dot_git_paths(root_abs_path.as_path(), ignored_dir.clone())
+                .await;
+            if !dot_git_paths.is_empty() {
+                found.push((ignored_dir, dot_git_paths));
+            }
+        }
+        if found.is_empty() {
+            return;
+        }
+
+        let (scan_job_tx, scan_job_rx) = async_channel::unbounded();
+        {
+            let mut state = self.state.lock().await;
+            for (ignored_dir, dot_git_paths) in found {
+                let Some(entry) = state.snapshot.entry_for_path(&ignored_dir).cloned() else {
+                    continue;
+                };
+                if entry.kind != EntryKind::UnloadedDir {
+                    continue;
+                }
+                // `should_scan_directory` admits directories on the way to these paths.
+                state.paths_to_scan.extend(dot_git_paths);
+                state
+                    .enqueue_scan_dir(
+                        root_abs_path
+                            .as_path()
+                            .join(ignored_dir.as_std_path())
+                            .into(),
+                        &entry,
+                        &scan_job_tx,
+                        self.fs.as_ref(),
+                    )
+                    .await;
+            }
+        }
+        drop(scan_job_tx);
+        while let Ok(job) = scan_job_rx.recv().await {
+            self.scan_dir(&job).await.log_err();
+        }
+        self.state.lock().await.paths_to_scan.clear();
+    }
+
+    /// Paths of `.git` entries in `dir` and up to [`IGNORED_REPOSITORY_SEARCH_DEPTH`] levels
+    /// below it, not looking inside the repositories found.
+    async fn find_dot_git_paths(
+        &self,
+        root_abs_path: &Path,
+        dir: Arc<RelPath>,
+    ) -> Vec<Arc<RelPath>> {
+        let Ok(dot_git_name) = RelPath::from_unix_str(DOT_GIT) else {
+            return Vec::new();
+        };
+        let mut dot_git_paths = Vec::new();
+        let mut pending = vec![(dir, 0)];
+        while let Some((dir, depth)) = pending.pop() {
+            let abs_path = root_abs_path.join(dir.as_std_path());
+            let Ok(children) = self.fs.read_dir(&abs_path).await else {
+                continue;
+            };
+            let children = children
+                .filter_map(|child| async { child.ok() })
+                .collect::<Vec<_>>()
+                .await;
+            if children
+                .iter()
+                .any(|child| child.file_name() == Some(OsStr::new(DOT_GIT)))
+            {
+                dot_git_paths.push(dir.join(dot_git_name).into());
+                continue;
+            }
+            if depth >= IGNORED_REPOSITORY_SEARCH_DEPTH {
+                continue;
+            }
+            for child_abs_path in children {
+                let Some(child_path) = child_abs_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| RelPath::from_unix_str(name).ok())
+                    .map(|name| Arc::<RelPath>::from(dir.join(name)))
+                else {
+                    continue;
+                };
+                if self.settings.is_path_excluded(&child_path) {
+                    continue;
+                }
+                if let Ok(Some(metadata)) = self.fs.metadata(&child_abs_path).await
+                    && metadata.is_dir
+                    && !metadata.is_symlink
+                {
+                    pending.push((child_path, depth + 1));
+                }
+            }
+        }
+        dot_git_paths
     }
 
     async fn forcibly_load_paths(&self, paths: &[Arc<RelPath>]) -> bool {
