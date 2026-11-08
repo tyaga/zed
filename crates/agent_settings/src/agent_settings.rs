@@ -242,6 +242,7 @@ pub struct AgentSettings {
     pub expand_edit_card: bool,
     pub expand_terminal_card: bool,
     pub collapse_activity: bool,
+    pub default_agent: Option<String>,
     pub terminal_init_command: Option<String>,
     pub thinking_display: ThinkingBlockDisplay,
     pub cancel_generation_on_terminal_stop: bool,
@@ -838,6 +839,9 @@ impl Settings for AgentSettings {
             expand_edit_card: agent.expand_edit_card.unwrap(),
             expand_terminal_card: agent.expand_terminal_card.unwrap(),
             collapse_activity: agent.collapse_activity.unwrap(),
+            default_agent: agent
+                .default_agent
+                .filter(|default_agent| !default_agent.trim().is_empty()),
             terminal_init_command: agent
                 .terminal_init_command
                 .filter(|command| !command.trim().is_empty()),

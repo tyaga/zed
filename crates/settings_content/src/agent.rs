@@ -365,6 +365,12 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub collapse_activity: Option<bool>,
+    /// Agent that the agent panel selects when it opens without a thread to restore:
+    /// the name of an entry in `agent_servers`, or "Zed Agent". An agent that is
+    /// not installed is ignored.
+    ///
+    /// Default: null
+    pub default_agent: Option<String>,
     /// Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     /// The command is sent to the shell as if typed, so it is interpreted by your
     /// configured shell (including on Windows and remote/WSL projects).

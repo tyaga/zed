@@ -1398,15 +1398,21 @@ impl AgentPanel {
                     // (e.g. a draft created while a different agent was
                     // active). When restoring a thread, prefer its agent
                     // so the draft survives reload bound to the right
-                    // backend; otherwise fall back to the serialized
-                    // selection, then the global last-used agent.
+                    // backend; otherwise use the `default_agent` setting,
+                    // then the serialized selection, then the global
+                    // last-used agent.
                     // Keep a session's agent so users can resume it after reinstalling the agent.
                     let restored_thread_agent = thread_to_restore.as_ref().and_then(|(info, _)| {
                         let agent = clamp(info.agent_type.clone());
                         (info.session_id.is_some() || panel.should_restore_agent(&agent, cx))
                             .then_some(agent)
                     });
-                    let initial_agent = restored_thread_agent.or_else(|| {
+                    let default_agent = AgentSettings::get_global(cx)
+                        .default_agent
+                        .clone()
+                        .map(|name| clamp(AgentId::new(name).into()))
+                        .filter(|agent| panel.should_restore_agent(agent, cx));
+                    let initial_agent = restored_thread_agent.or(default_agent).or_else(|| {
                         serialized_panel
                             .as_ref()
                             .and_then(|p| p.selected_agent.clone())
@@ -12633,6 +12639,101 @@ mod tests {
                 "an installed global agent should be used when the workspace agent was uninstalled"
             );
         });
+    }
+
+    fn set_default_agent(default_agent: Option<&str>, cx: &mut App) {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.agent.get_or_insert_default().default_agent =
+                    default_agent.map(ToString::to_string);
+            });
+        });
+    }
+
+    async fn reload_panel_with_selected_agent(
+        selected_agent: Agent,
+        cx: &mut TestAppContext,
+    ) -> Agent {
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| {
+            workspace.set_random_database_id();
+        });
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            cx.new(|cx| AgentPanel::new(workspace, window, cx))
+        });
+        panel.update(cx, |panel, cx| {
+            panel.selected_agent = selected_agent;
+            panel.serialize(cx);
+        });
+        cx.run_until_parked();
+
+        let async_cx = cx.update(|window, cx| window.to_async(cx));
+        let reloaded_panel = AgentPanel::load(workspace.downgrade(), async_cx)
+            .await
+            .expect("panel load should succeed");
+        cx.run_until_parked();
+        reloaded_panel.read_with(cx, |panel, _cx| panel.selected_agent.clone())
+    }
+
+    #[gpui::test]
+    async fn test_default_agent_setting_overrides_saved_selection(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            install_custom_agent("default-agent", cx);
+            install_custom_agent("global-agent", cx);
+            set_default_agent(Some("default-agent"), cx);
+            // Use an isolated DB so parallel tests can't overwrite our global key.
+            cx.set_global(db::AppDatabase::test_new());
+        });
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        write_global_last_used_agent(
+            kvp,
+            Agent::Custom {
+                id: "global-agent".into(),
+            },
+        )
+        .await;
+
+        let selected_agent = reload_panel_with_selected_agent(Agent::NativeAgent, cx).await;
+
+        assert_eq!(
+            selected_agent,
+            Agent::Custom {
+                id: "default-agent".into(),
+            },
+            "the default agent setting should win over the workspace and global selections"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_uninstalled_default_agent_falls_back_to_saved_selection(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            install_custom_agent("workspace-agent", cx);
+            set_default_agent(Some("uninstalled-agent"), cx);
+            cx.set_global(db::AppDatabase::test_new());
+        });
+        let workspace_agent = Agent::Custom {
+            id: "workspace-agent".into(),
+        };
+
+        let selected_agent = reload_panel_with_selected_agent(workspace_agent.clone(), cx).await;
+
+        assert_eq!(selected_agent, workspace_agent);
     }
 
     #[gpui::test]
