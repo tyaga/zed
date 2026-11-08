@@ -139,7 +139,6 @@ pub struct ParkedRepository {
 }
 
 impl ParkedRepository {
-    #[cfg(feature = "test-support")]
     pub fn work_directory_abs_path(&self) -> &Path {
         &self.work_directory_abs_path
     }
@@ -884,6 +883,7 @@ pub enum GitStoreEvent {
     ConflictsUpdated,
     GlobalConfigurationUpdated,
     DiffBaseChanged(Option<RepositoryId>),
+    ParkedRepositoriesChanged,
 }
 
 impl EventEmitter<RepositoryEvent> for Repository {}
@@ -2433,8 +2433,12 @@ impl GitStore {
                 self.local_worktree_git_repos_changed(worktree, changed_repos, cx);
             }
             WorktreeStoreEvent::WorktreeRemoved(_entity_id, worktree_id) => {
+                let parked_before = self.parked_repository_keys();
                 self.parked_repositories
                     .retain(|parked| parked.worktree_id != *worktree_id);
+                if parked_before != self.parked_repository_keys() {
+                    cx.emit(GitStoreEvent::ParkedRepositoriesChanged);
+                }
                 let repos_without_worktree: Vec<RepositoryId> = self
                     .worktree_ids
                     .iter_mut()
@@ -2555,6 +2559,7 @@ impl GitStore {
         cx: &mut Context<Self>,
     ) {
         let mut removed_ids = Vec::new();
+        let parked_before = self.parked_repository_keys();
 
         let is_trusted = TrustedWorktrees::try_get_global(cx)
             .map(|trusted_worktrees| {
@@ -2663,6 +2668,10 @@ impl GitStore {
                     self.register_local_repository(parked_repository, cx);
                 }
             }
+        }
+
+        if parked_before != self.parked_repository_keys() {
+            cx.emit(GitStoreEvent::ParkedRepositoriesChanged);
         }
 
         for id in removed_ids {
@@ -2801,9 +2810,38 @@ impl GitStore {
         let (to_activate, to_keep) = mem::take(&mut self.parked_repositories)
             .into_iter()
             .partition::<Vec<_>, _>(|parked| should_activate(parked));
+        let changed = !to_activate.is_empty();
         self.parked_repositories = to_keep;
+        if changed {
+            cx.emit(GitStoreEvent::ParkedRepositoriesChanged);
+        }
         for parked in to_activate {
             self.register_local_repository(parked, cx);
+        }
+    }
+
+    fn parked_repository_keys(&self) -> Vec<(WorktreeId, Arc<Path>)> {
+        self.parked_repositories
+            .iter()
+            .map(|parked| (parked.worktree_id, parked.work_directory_abs_path.clone()))
+            .collect()
+    }
+
+    pub fn activate_parked_repository(
+        &mut self,
+        work_directory_abs_path: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_parked_repositories(
+            |parked| parked.work_directory_abs_path.as_ref() == work_directory_abs_path,
+            cx,
+        );
+        let repository_id = self.repositories.iter().find_map(|(id, repository)| {
+            (repository.read(cx).work_directory_abs_path.as_ref() == work_directory_abs_path)
+                .then_some(*id)
+        });
+        if let Some(repository_id) = repository_id {
+            self.set_active_repo_id(repository_id, cx);
         }
     }
 
@@ -2918,7 +2956,6 @@ impl GitStore {
         );
     }
 
-    #[cfg(feature = "test-support")]
     pub fn parked_repositories(&self) -> &[ParkedRepository] {
         &self.parked_repositories
     }

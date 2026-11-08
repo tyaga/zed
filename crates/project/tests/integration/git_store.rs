@@ -2034,6 +2034,7 @@ mod repository_activation_tests {
     };
 
     use crate::{Project, ProjectPath};
+    use project::git_store::GitStoreEvent;
 
     #[gpui::test]
     async fn test_deep_repositories_park_in_unmanaged_root(cx: &mut TestAppContext) {
@@ -2074,6 +2075,115 @@ mod repository_activation_tests {
                 Some(rel_path("nested/deep/repo2/src/b.txt"))
             );
         });
+    }
+
+    fn nested_repositories_tree() -> serde_json::Value {
+        json!({
+            "repo1": {
+                ".git": {},
+                "a.txt": ""
+            },
+            "nested": {
+                "deep": {
+                    "repo2": {
+                        ".git": {},
+                        "src": {
+                            "b.txt": ""
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn active_repository_path(
+        project: &Entity<Project>,
+        cx: &mut TestAppContext,
+    ) -> Option<PathBuf> {
+        project.read_with(cx, |project, cx| {
+            project
+                .git_store()
+                .read(cx)
+                .active_repository()
+                .map(|repository| repository.read(cx).work_directory_abs_path.to_path_buf())
+        })
+    }
+
+    #[gpui::test]
+    async fn test_activate_parked_repository_registers_and_selects_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, project) = build_project(cx, nested_repositories_tree()).await;
+
+        project.update(cx, |project, cx| {
+            project.git_store().update(cx, |git_store, cx| {
+                git_store.activate_parked_repository(path!("/root/nested/deep/repo2").as_ref(), cx);
+            });
+        });
+        cx.executor().run_until_parked();
+
+        assert_repositories(
+            &project,
+            cx,
+            &[path!("/root/nested/deep/repo2"), path!("/root/repo1")],
+            &[],
+        );
+        assert_eq!(
+            active_repository_path(&project, cx),
+            Some(PathBuf::from(path!("/root/nested/deep/repo2")))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_activate_parked_repository_on_loaded_path_selects_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, project) = build_project(cx, nested_repositories_tree()).await;
+
+        for _ in 0..2 {
+            project.update(cx, |project, cx| {
+                project.git_store().update(cx, |git_store, cx| {
+                    git_store
+                        .activate_parked_repository(path!("/root/nested/deep/repo2").as_ref(), cx);
+                });
+            });
+            cx.executor().run_until_parked();
+        }
+
+        assert_repositories(
+            &project,
+            cx,
+            &[path!("/root/nested/deep/repo2"), path!("/root/repo1")],
+            &[],
+        );
+        assert_eq!(
+            active_repository_path(&project, cx),
+            Some(PathBuf::from(path!("/root/nested/deep/repo2")))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_parked_repositories_changed_event(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_fs, project) = build_project(cx, nested_repositories_tree()).await;
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let git_store = project.read_with(cx, |project, _| project.git_store().clone());
+        let _subscription = cx.update(|cx| {
+            let events = events.clone();
+            cx.subscribe(&git_store, move |_, event, _| {
+                if matches!(event, GitStoreEvent::ParkedRepositoriesChanged) {
+                    events.lock().unwrap().push(());
+                }
+            })
+        });
+
+        project.update(cx, |project, cx| {
+            project.git_store().update(cx, |git_store, cx| {
+                git_store.activate_parked_repository(path!("/root/nested/deep/repo2").as_ref(), cx);
+            });
+        });
+        cx.executor().run_until_parked();
+
+        assert!(!events.lock().unwrap().is_empty());
     }
 
     #[gpui::test]

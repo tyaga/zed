@@ -1693,6 +1693,9 @@ impl GitPanel {
                         this.git_access = None;
                         this.schedule_update(window, cx);
                     }
+                    GitStoreEvent::ParkedRepositoriesChanged => {
+                        this.schedule_update(window, cx);
+                    }
                     GitStoreEvent::IndexWriteError(error) => {
                         this.workspace
                             .update(cx, |workspace, cx| {
